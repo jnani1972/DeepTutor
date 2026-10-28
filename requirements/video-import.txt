@@ -1,2 +1,4 @@
 # YouTube playlist import (yt-dlp is used for metadata listing only).
 yt-dlp>=2025.1.1
+# In-page real-time capture (audio from the <video> element, frame screenshots).
+playwright>=1.48,<2
