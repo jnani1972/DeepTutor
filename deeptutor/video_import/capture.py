@@ -12,8 +12,10 @@ import asyncio
 import base64
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import re
+import tempfile
 import time
 from typing import Any, Literal, Protocol
 from urllib.parse import parse_qs, urlparse
@@ -200,6 +202,13 @@ _STATUS_JS = """() => {
 _METADATA_JS = "() => [window.ytInitialPlayerResponse || {}, window.ytInitialData || {}]"
 
 
+def _raise_for(verdict: str, detail: str) -> None:
+    if verdict == "challenge":
+        raise BotChallengeError(f"YouTube asked for a human check: {detail}")
+    if verdict != "ok":
+        raise VideoUnavailableError(verdict, f"{verdict}: {detail}")
+
+
 def _watch_id(url: str) -> str | None:
     parsed = urlparse(url)
     if parsed.path != "/watch":
@@ -237,25 +246,32 @@ class PlaywrightCapture(CaptureBackend):
                 handle.write(base64.b64decode(chunk_b64))
 
         args = ["--autoplay-policy=no-user-gesture-required"]
-        async with async_playwright() as pw:
-            if self.mode is CaptureMode.profile:
-                context = await pw.chromium.launch_persistent_context(
-                    str(self.profile_dir), headless=False, args=args
-                )
-                browser = None
-            else:
-                browser = await pw.chromium.launch(
-                    headless=self.mode is CaptureMode.headless, channel="chromium", args=args
-                )
-                context = await browser.new_context()
-            try:
-                page = await context.new_page()
-                await page.expose_function("__dtAudioChunk", on_audio_chunk)
-                result = await self._play(page, entry, frames_dir)
-            finally:
-                await context.close()
-                if browser is not None:
-                    await browser.close()
+        with tempfile.TemporaryDirectory(prefix="dt-chromium-") as scratch:
+            # The Docker runtime user has no home directory; Chromium's crash
+            # handler aborts the launch unless its config/cache dirs are writable.
+            env = {**os.environ, "XDG_CONFIG_HOME": scratch, "XDG_CACHE_HOME": scratch}
+            async with async_playwright() as pw:
+                if self.mode is CaptureMode.profile:
+                    context = await pw.chromium.launch_persistent_context(
+                        str(self.profile_dir), headless=False, args=args, env=env
+                    )
+                    browser = None
+                else:
+                    browser = await pw.chromium.launch(
+                        headless=self.mode is CaptureMode.headless,
+                        channel="chromium",
+                        args=args,
+                        env=env,
+                    )
+                    context = await browser.new_context()
+                try:
+                    page = await context.new_page()
+                    await page.expose_function("__dtAudioChunk", on_audio_chunk)
+                    result = await self._play(page, entry, frames_dir)
+                finally:
+                    await context.close()
+                    if browser is not None:
+                        await browser.close()
 
         has_audio = audio_path.exists() and audio_path.stat().st_size > 0
         result.audio_path = audio_path if has_audio else None
@@ -263,11 +279,7 @@ class PlaywrightCapture(CaptureBackend):
 
     async def _check_page(self, page: Any) -> None:
         status, text = await page.evaluate(_STATUS_JS)
-        verdict = classify_page(page.url, text, status)
-        if verdict == "challenge":
-            raise BotChallengeError(f"YouTube asked for a human check at {page.url}")
-        if verdict != "ok":
-            raise VideoUnavailableError(verdict, f"video unavailable ({verdict})")
+        _raise_for(classify_page(page.url, text, status), f"video unavailable at {page.url}")
 
     async def _play(self, page: Any, entry: PlaylistEntry, frames_dir: Path) -> CaptureResult:
         from playwright.async_api import Error as PlaywrightError
@@ -301,6 +313,12 @@ class PlaywrightCapture(CaptureBackend):
             state = await page.evaluate("() => window.__dtCapture.state()")
             if state["ended"]:
                 break
+            if state["error"]:
+                # Playback died in the player; never report a partial capture as done.
+                _raise_for(
+                    classify_page(page.url, state["error"], None),
+                    f"player error after {elapsed:.0f}s: {' '.join(state['error'].split())}",
+                )
             action = gate.update(bool(state["ad"]), elapsed)
             if action == "pause":
                 await page.evaluate("() => window.__dtCapture.pause()")

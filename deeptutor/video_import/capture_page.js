@@ -76,8 +76,11 @@
     state() {
       const v = video();
       const p = player();
-      if (v && v.paused && !v.ended) v.play().catch(() => {});
+      // YouTube's in-player error overlay (e.g. "Something went wrong").
+      const error = document.querySelector("#movie_player .ytp-error");
+      if (v && v.paused && !v.ended && !error) v.play().catch(() => {});
       return {
+        error: error && error.offsetParent !== null ? error.innerText.trim() : "",
         ad: !!(p && p.classList.contains("ad-showing")),
         t: v ? v.currentTime : 0,
         duration: v && Number.isFinite(v.duration) ? v.duration : 0,
