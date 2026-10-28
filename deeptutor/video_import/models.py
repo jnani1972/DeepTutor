@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -83,6 +83,11 @@ class ImportJob:
     updated_at: str
     error_code: str = ""
     error_detail: str = ""
+    # Who created the job ({"id", "username", "role", "scope_kind", "scope_root"};
+    # empty for the local admin) and the content workspace it was created in.
+    # The worker re-establishes both before writing to the owner's knowledge base.
+    owner: dict[str, str] = field(default_factory=dict)
+    workspace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -127,4 +132,6 @@ class ImportJob:
             updated_at=data["updated_at"],
             error_code=data.get("error_code", ""),
             error_detail=data.get("error_detail", ""),
+            owner=dict(data.get("owner") or {}),
+            workspace_id=data.get("workspace_id", ""),
         )

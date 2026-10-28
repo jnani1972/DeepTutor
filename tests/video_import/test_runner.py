@@ -1,0 +1,353 @@
+from pathlib import Path
+
+import pytest
+
+from deeptutor.multi_user.context import (
+    get_current_user_or_none,
+    reset_current_user,
+    set_current_user,
+)
+from deeptutor.multi_user.models import CurrentUser, UserScope
+from deeptutor.reading.ingestion import TranscriptSegment
+from deeptutor.video_import import runner as runner_module
+from deeptutor.video_import.capture import CaptureSink
+from deeptutor.video_import.files import file_video_id
+from deeptutor.video_import.listing import Listing
+from deeptutor.video_import.models import (
+    CaptureMode,
+    JobStatus,
+    PlaylistEntry,
+    VideoStage,
+)
+from deeptutor.video_import.notes import Chapter, FrameNote
+from deeptutor.video_import.runner import ImportRunner
+from deeptutor.video_import.store import ImportJobStore
+
+PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL123"
+
+
+class FakeSwitcher:
+    def __init__(self, calls: list) -> None:
+        self.calls = calls
+
+    async def free_for_stt(self) -> None:
+        self.calls.append("free_for_stt")
+
+    async def free_for_vision(self) -> None:
+        self.calls.append("free_for_vision")
+
+    async def restore_chat(self) -> None:
+        self.calls.append("restore_chat")
+
+
+class FakeFileCapture:
+    def __init__(self, jpeg_of) -> None:
+        self.jpeg_of = jpeg_of
+        self.sources: list[Path] = []
+
+    async def capture(self, entry, out_dir, *, source):
+        self.sources.append(source)
+        sink = CaptureSink(out_dir)
+        sink.append_audio(b"audio")
+        sink.offer_frame(0, self.jpeg_of(0))
+        sink.offer_frame(5, self.jpeg_of(255))
+        return sink.finish(ad_seconds=0.0, description="from file")
+
+
+class Harness:
+    def __init__(self, tmp_path: Path, jpeg_of) -> None:
+        self.calls: list = []
+        self.kb_users: list = []
+        self.listing = Listing(
+            "My List",
+            [PlaylistEntry("a", "A", 100, 1), PlaylistEntry("b", "B", 100, 2)],
+        )
+        self.speech = {"a": "hello", "b": "world"}
+        self.store = ImportJobStore(root=tmp_path / "vi")
+        self.file_capture = FakeFileCapture(jpeg_of)
+        self.runner = ImportRunner(
+            self.store,
+            file_capture=self.file_capture,
+            details=self.details,
+            transcribe=self.transcribe,
+            describe=self.describe,
+            add_to_kb=self.add_to_kb,
+            switcher=FakeSwitcher(self.calls),
+            lister=self.lister,
+            folder_lister=self.folder_lister,
+        )
+        self.on_transcribe = None
+
+    async def details(self, video_id):
+        return [Chapter(0.0, "Intro")], f"about {video_id}"
+
+    async def transcribe(self, audio_path: Path):
+        video_id = audio_path.parent.name
+        self.calls.append(f"transcribe {video_id}")
+        assert audio_path.read_bytes()
+        if self.on_transcribe:
+            await self.on_transcribe(video_id)
+        text = self.speech.get(video_id, "")
+        return [TranscriptSegment(1.0, 2.0, text)] if text else []
+
+    async def describe(self, frames):
+        video_id = frames[0].path.parent.parent.name if frames else "-"
+        self.calls.append(f"describe {video_id}")
+        assert all(frame.path.exists() for frame in frames)
+        return [FrameNote(frames[0].t_seconds, f"slide of {video_id}")] if frames else []
+
+    async def add_to_kb(self, kb_name, notes_files):
+        self.calls.append(("add_to_kb", kb_name, [p.name for p in notes_files]))
+        assert all(p.exists() for p in notes_files)
+        self.kb_users.append(get_current_user_or_none())
+
+    async def lister(self, target):
+        return self.listing
+
+    async def folder_lister(self, folder):
+        folder = Path(folder)
+        files = sorted(folder.glob("*.mp3"))
+        return Listing(
+            folder.name,
+            [
+                PlaylistEntry(file_video_id(folder, p), p.stem, 60, i)
+                for i, p in enumerate(files, start=1)
+            ],
+        )
+
+    async def play(self, job_id, video_id, jpeg_of, *, until=95, ended=True):
+        sink = self.runner.begin_capture(job_id, video_id)
+        sink.append_audio(b"chunk")
+        for t, grey in ((0, 0), (until // 2, 128), (until, 255)):
+            sink.offer_frame(t, jpeg_of(grey))
+        return await self.runner.finish_capture(
+            job_id, video_id, ended=ended, ad_seconds=3.0, player_duration=100.0
+        )
+
+
+@pytest.fixture(autouse=True)
+def stt_configured(monkeypatch):
+    monkeypatch.setattr(runner_module, "_probe_stt_configuration", lambda: "")
+
+
+@pytest.fixture
+def user(tmp_path):
+    owner = CurrentUser(
+        id="u1",
+        username="u1",
+        role="user",
+        scope=UserScope(kind="user", user_id="u1", root=tmp_path / "u1"),
+    )
+    token = set_current_user(owner)
+    yield owner
+    reset_current_user(token)
+
+
+@pytest.fixture
+def h(tmp_path, jpeg_of):
+    return Harness(tmp_path, jpeg_of)
+
+
+def _stages(job):
+    return {v.video_id: v.stage for v in job.videos}
+
+
+@pytest.mark.asyncio
+async def test_browser_job_waits_for_playback_then_processes_automatically(
+    h, jpeg_of, user, tmp_path
+):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    assert job.status is JobStatus.waiting_for_playback
+    assert job.capture_mode is CaptureMode.browser
+    assert job.kb_name == "yt-my-list"
+
+    # Capture finishes outside the creating request's user context; the
+    # worker must still index into the owner's knowledge bases.
+    token = set_current_user(
+        CurrentUser("other", "other", "user", UserScope("user", "other", tmp_path / "o"))
+    )
+    try:
+        await h.play(job.job_id, "a", jpeg_of)
+        assert h.store.load(job.job_id).status is JobStatus.waiting_for_playback
+        await h.play(job.job_id, "b", jpeg_of)
+        await h.runner.drain()
+    finally:
+        reset_current_user(token)
+
+    assert h.calls == [
+        "free_for_stt",
+        "transcribe a",
+        "transcribe b",
+        "free_for_vision",
+        "describe a",
+        "describe b",
+        "restore_chat",
+        ("add_to_kb", "yt-my-list", ["001-a.md", "002-b.md"]),
+    ]
+    assert h.kb_users == [user]
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.done
+    assert _stages(job) == {"a": VideoStage.done, "b": VideoStage.done}
+    assert job.videos[0].speech_cues == 1 and job.videos[0].frame_notes == 1
+    notes = h.store.notes_path(job.job_id, h.listing.entries[0]).read_text(encoding="utf-8")
+    assert "Intro" in notes and "about a" in notes and "hello" in notes and "slide of a" in notes
+    work = h.store.root / "work" / job.job_id
+    assert not list(work.rglob("audio.webm")) and not list(work.rglob("*.jpg"))
+
+
+@pytest.mark.asyncio
+async def test_incomplete_capture_requeues_video(h, jpeg_of):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    job = await h.play(job.job_id, "a", jpeg_of, until=30, ended=False)
+    video = job.videos[0]
+    assert video.stage is VideoStage.queued
+    assert video.error_code == "incomplete_capture"
+    assert job.status is JobStatus.waiting_for_playback
+    video_dir = h.store.video_dir(job.job_id, "a")
+    assert not (video_dir / "audio.webm").exists()
+    assert not list((video_dir / "frames").glob("*.jpg"))
+    with pytest.raises(KeyError):
+        h.runner.sink(job.job_id, "a")
+
+
+@pytest.mark.asyncio
+async def test_player_error_skips_video_with_code(h, jpeg_of):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    h.runner.begin_capture(job.job_id, "a")
+    job = await h.runner.finish_capture(
+        job.job_id, "a", ended=False, ad_seconds=0, player_duration=0, error_code="embed_blocked"
+    )
+    assert job.videos[0].stage is VideoStage.skipped
+    assert job.videos[0].error_code == "embed_blocked"
+
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+    job = h.store.load(job.job_id)
+    assert _stages(job) == {"a": VideoStage.skipped, "b": VideoStage.done}
+    assert job.status is JobStatus.done
+
+
+@pytest.mark.asyncio
+async def test_file_job_captures_and_processes_unattended(h, tmp_path):
+    folder = tmp_path / "lectures"
+    folder.mkdir()
+    for name in ("1 intro.mp3", "2 more.mp3"):
+        (folder / name).write_bytes(b"fake")
+    job = await h.runner.create(folder=str(folder))
+    assert job.capture_mode is CaptureMode.file
+    assert job.kb_name == "files-lectures"
+    await h.runner.drain()
+
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.done
+    assert [v.stage for v in job.videos] == [VideoStage.done, VideoStage.done]
+    assert h.file_capture.sources == [folder / "1 intro.mp3", folder / "2 more.mp3"]
+    assert h.calls[0] == "free_for_stt"
+    assert h.calls[-1][0] == "add_to_kb"
+
+
+@pytest.mark.asyncio
+async def test_video_without_speech_finishes_done(h, jpeg_of):
+    h.speech = {}
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.done
+    assert job.videos[0].speech_cues == 0
+    notes = h.store.notes_path(job.job_id, h.listing.entries[0]).read_text(encoding="utf-8")
+    assert "No speech was detected" in notes
+
+
+@pytest.mark.asyncio
+async def test_recover_requeues_interrupted_capture_only(h, jpeg_of, tmp_path):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    h.runner.begin_capture(job.job_id, "b")
+
+    fresh = Harness(tmp_path, jpeg_of)  # a restarted process: no in-memory sinks
+    await fresh.runner.recover()
+    job = fresh.store.load(job.job_id)
+    assert _stages(job) == {"a": VideoStage.captured, "b": VideoStage.queued}
+    assert job.status is JobStatus.waiting_for_playback
+    with pytest.raises(KeyError):
+        fresh.runner.sink(job.job_id, "b")
+    await fresh.runner.drain()
+    assert fresh.calls == []
+
+    await fresh.play(job.job_id, "b", jpeg_of)
+    await fresh.runner.drain()
+    assert fresh.store.load(job.job_id).status is JobStatus.done
+
+
+@pytest.mark.asyncio
+async def test_reimport_skips_done_videos_and_reuses_kb(h, jpeg_of):
+    first = await h.runner.create(url=PLAYLIST_URL, kb_name="my-course")
+    await h.play(first.job_id, "a", jpeg_of)
+    h.runner.begin_capture(first.job_id, "b")
+    await h.runner.finish_capture(
+        first.job_id, "b", ended=False, ad_seconds=0, player_duration=0, error_code="removed"
+    )
+    await h.runner.drain()
+
+    again = await h.runner.create(url=PLAYLIST_URL)
+    assert again.kb_name == "my-course"
+    assert _stages(again) == {"a": VideoStage.skipped, "b": VideoStage.queued}
+    assert again.videos[0].error_code == "already_imported"
+
+
+@pytest.mark.asyncio
+async def test_pause_between_videos_restores_chat(h, jpeg_of):
+    job = await h.runner.create(url=PLAYLIST_URL)
+
+    async def pause_after_first(video_id):
+        if video_id == "a":
+            await h.runner.pause(job.job_id)
+
+    h.on_transcribe = pause_after_first
+    await h.play(job.job_id, "a", jpeg_of)
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+
+    paused = h.store.load(job.job_id)
+    assert paused.status is JobStatus.paused
+    assert _stages(paused) == {"a": VideoStage.transcribed, "b": VideoStage.captured}
+    assert h.calls == ["free_for_stt", "transcribe a", "restore_chat"]
+
+    h.on_transcribe = None
+    await h.runner.resume(job.job_id)
+    await h.runner.drain()
+    assert h.store.load(job.job_id).status is JobStatus.done
+    assert h.calls.count("transcribe a") == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_stt_fails_job_and_restores_chat(h, jpeg_of, monkeypatch):
+    monkeypatch.setattr(runner_module, "_probe_stt_configuration", lambda: "No STT model")
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.failed
+    assert (job.error_code, job.error_detail) == ("stt_not_configured", "No STT model")
+    assert h.calls == ["restore_chat"]
+
+
+@pytest.mark.asyncio
+async def test_transcription_failure_fails_only_that_video(h, jpeg_of):
+    async def boom(video_id):
+        if video_id == "a":
+            raise RuntimeError("stt down")
+
+    h.on_transcribe = boom
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.done
+    assert _stages(job) == {"a": VideoStage.failed, "b": VideoStage.done}
+    assert "stt down" in job.videos[0].error_detail
+    assert (h.store.video_dir(job.job_id, "a") / "audio.webm").exists()
