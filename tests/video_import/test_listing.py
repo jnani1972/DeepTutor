@@ -1,8 +1,15 @@
 import pytest
 from yt_dlp.utils import DownloadError
 
-from deeptutor.video_import.listing import ListingError, default_ydl_options, list_target
+from deeptutor.video_import.listing import (
+    ListingError,
+    default_ydl_options,
+    details_ydl_options,
+    fetch_video_details,
+    list_target,
+)
 from deeptutor.video_import.models import ImportTarget, PlaylistEntry, TargetKind
+from deeptutor.video_import.notes import Chapter
 
 
 @pytest.mark.asyncio
@@ -69,4 +76,35 @@ async def test_video_extractor_error_and_parse_failure():
 def test_default_extractor_never_fetches_media():
     opts = default_ydl_options()
     assert opts["extract_flat"] in ("in_playlist", True) and opts["skip_download"] is True
+    assert "format" not in opts and "outtmpl" not in opts
+
+
+@pytest.mark.asyncio
+async def test_fetch_video_details_maps_chapters_and_description():
+    async def extract(_url):
+        return {
+            "description": "About enzymes.",
+            "chapters": [
+                {"start_time": 0.0, "title": "Intro"},
+                {"start_time": 200.0, "title": "Energy"},
+            ],
+        }
+
+    assert await fetch_video_details("aaaaaaaaaaa", extract=extract) == (
+        [Chapter(0.0, "Intro"), Chapter(200.0, "Energy")],
+        "About enzymes.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_video_details_failure_is_empty():
+    async def boom(_url):
+        raise RuntimeError("x")
+
+    assert await fetch_video_details("aaaaaaaaaaa", extract=boom) == ([], "")
+
+
+def test_details_options_never_fetch_media():
+    opts = details_ydl_options()
+    assert opts["skip_download"] is True
     assert "format" not in opts and "outtmpl" not in opts

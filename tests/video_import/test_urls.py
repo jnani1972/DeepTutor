@@ -48,9 +48,26 @@ def test_job_round_trips_through_dict():
         title="t",
         kb_name="kb",
         status=JobStatus.pending,
-        capture_mode=CaptureMode.headless,
+        capture_mode=CaptureMode.browser,
         videos=[VideoState("dQw4w9WgXcQ", "t", 1, 212)],
         created_at="2026-10-29T00:00:00Z",
         updated_at="2026-10-29T00:00:00Z",
     )
     assert ImportJob.from_dict(job.to_dict()) == job
+
+
+def test_job_with_folder_target_round_trips():
+    job = ImportJob(
+        job_id="j2",
+        source_url="D:/lectures",
+        target=ImportTarget(TargetKind.FOLDER, None, None, folder="D:/lectures"),
+        title="t",
+        kb_name="kb",
+        status=JobStatus.waiting_for_playback,
+        capture_mode=CaptureMode.file,
+        videos=[],
+        created_at="2026-10-29T00:00:00Z",
+        updated_at="2026-10-29T00:00:00Z",
+    )
+    restored = ImportJob.from_dict(job.to_dict())
+    assert restored == job and restored.target.folder == "D:/lectures"

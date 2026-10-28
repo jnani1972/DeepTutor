@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
@@ -10,6 +10,7 @@ from typing import Any
 class TargetKind(str, Enum):
     PLAYLIST = "playlist"
     VIDEO = "video"
+    FOLDER = "folder"
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class ImportTarget:
     kind: TargetKind
     playlist_id: str | None
     video_id: str | None
+    folder: str | None = None
 
 
 @dataclass
@@ -43,16 +45,15 @@ class JobStatus(str, Enum):
     capturing = "capturing"
     processing = "processing"
     paused = "paused"
-    waiting_for_user = "waiting_for_user"
+    waiting_for_playback = "waiting_for_playback"
     done = "done"
     failed = "failed"
     cancelled = "cancelled"
 
 
 class CaptureMode(str, Enum):
-    headless = "headless"
-    headed = "headed"
-    profile = "profile"
+    browser = "browser"
+    file = "file"
 
 
 @dataclass
@@ -99,7 +100,10 @@ class ImportJob:
             job_id=data["job_id"],
             source_url=data["source_url"],
             target=ImportTarget(
-                TargetKind(target["kind"]), target.get("playlist_id"), target.get("video_id")
+                TargetKind(target["kind"]),
+                target.get("playlist_id"),
+                target.get("video_id"),
+                target.get("folder"),
             ),
             title=data["title"],
             kb_name=data["kb_name"],

@@ -14,6 +14,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 from .models import ImportTarget, PlaylistEntry, TargetKind
+from .notes import Chapter
 
 MetadataExtractor = Callable[[str], Awaitable[dict]]
 
@@ -40,6 +41,11 @@ def default_ydl_options() -> dict:
         "quiet": True,
         "no_warnings": True,
     }
+
+
+def details_ydl_options() -> dict:
+    """Per-video metadata only: no format selection, no output template."""
+    return {"skip_download": True, "quiet": True, "no_warnings": True}
 
 
 async def _default_extract(url: str) -> dict:
@@ -103,3 +109,27 @@ async def list_target(
     if target.kind is TargetKind.PLAYLIST:
         return _parse_playlist(info)
     return _parse_video(info)
+
+
+async def _details_extract(url: str) -> dict:
+    def run() -> dict:
+        with YoutubeDL(details_ydl_options()) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    return await asyncio.to_thread(run)
+
+
+async def fetch_video_details(
+    video_id: str, *, extract: MetadataExtractor | None = None
+) -> tuple[list[Chapter], str]:
+    """Chapters and description for one video; optional, so errors give empties."""
+    extract = extract or _details_extract
+    try:
+        info = await extract(f"https://www.youtube.com/watch?v={video_id}")
+        chapters = [
+            Chapter(float(c["start_time"]), c["title"])
+            for c in info.get("chapters") or []
+        ]
+        return chapters, info.get("description") or ""
+    except Exception:
+        return [], ""

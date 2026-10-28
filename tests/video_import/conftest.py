@@ -29,3 +29,17 @@ def png_bytes() -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+@pytest.fixture
+def jpeg_of():
+    import io
+
+    from PIL import Image
+
+    def make(value: int) -> bytes:
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 36), (value, value, value)).save(buffer, format="JPEG")
+        return buffer.getvalue()
+
+    return make
