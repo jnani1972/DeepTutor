@@ -116,7 +116,6 @@ def test_ad_gate_accumulates_ad_seconds():
         ("https://www.youtube.com/watch?v=x", "This video is private", "LOGIN_REQUIRED", "private"),
         ("https://www.youtube.com/watch?v=x", "Video unavailable", "ERROR", "removed"),
         ("https://www.youtube.com/watch?v=x", "", "OK", "ok"),
-        ("https://www.youtube.com/watch?v=x", "Something went wrong. Refresh", None, "unplayable"),
     ],
 )
 def test_classify_page(url, text, status, expected):

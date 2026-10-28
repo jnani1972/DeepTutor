@@ -151,7 +151,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-impress \
     fonts-noto-cjk \
     fonts-liberation \
-    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Node.js from node-runtime stage (platform-matched binary)
@@ -164,14 +163,6 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # Copy Python packages from builder stage
 COPY --from=python-base /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=python-base /usr/local/bin /usr/local/bin
-
-# YouTube video import plays videos in Chromium driven by Playwright (audio is
-# recorded from the in-page <video> element; nothing is downloaded). Browsers
-# go to a shared path so the unprivileged deeptutor user can find them.
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
-RUN python -m playwright install --with-deps chromium \
-    && chmod -R a+rX /opt/ms-playwright \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy built frontend from frontend-builder stage (standalone mode)
 # The standalone output contains a self-contained server.js + minimal node_modules
