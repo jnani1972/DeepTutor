@@ -184,6 +184,7 @@ server = [
     "json-repair>=0.57.0,<1.0.0",
     "croniter>=6.0.0,<7.0.0",
     "psutil>=5.9.0,<8.0.0",
+    "deeptutor[video-import]",
 ]
 
 # Partner channel SDKs. Mirrors requirements/partners.txt.
