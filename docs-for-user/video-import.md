@@ -54,3 +54,28 @@ docker exec deeptutor curl -sf http://speaches:8000/v1/models
 ## GPU memory note
 
 An 8 GB GPU shared with a local chat model (for example LM Studio) can run out of VRAM while Whisper is loaded. The model TTL above releases the GPU shortly after transcription; lower `STT_MODEL_TTL` if the chat model needs the memory sooner. Transcription always runs in the language spoken in the video (no language is forced).
+
+## Vision model
+
+Key frames are described by a local vision model through DeepTutor's image description setting (Settings → Document parsing → Image description model).
+
+Model: LM Studio `qwen/qwen3-vl-8b` (Qwen3 VL 8B Instruct, Q4_K_M GGUF, about 6.2 GB).
+
+```
+lms get qwen/qwen3-vl-8b -y
+```
+
+Add `qwen/qwen3-vl-8b` to the LM Studio profile's models in `model_catalog.json`, then set `image_description_model` in `document_parsing.json` to that profile and model id.
+
+An 8 GB GPU cannot hold the chat model and the vision model together. Load the vision model only while frames are described, then restore the chat model:
+
+```
+lms unload --all
+lms load qwen/qwen3-vl-8b -y
+# ... describe frames ...
+lms unload --all
+lms load qwen/qwen3-30b-a3b-2507 -c 16384 --gpu 0.35 -y
+lms load text-embedding-nomic-embed-text-v1.5 -y
+```
+
+Frames with no instructional content (talking head, blank screen) produce no note. A failed description batch is logged and skipped; the video import continues.
