@@ -1,0 +1,7 @@
+{"_type": "playlist", "id": "PLgaps", "title": "Gappy Playlist", "entries": [
+ {"id": "aaaaaaaaaaa", "title": "First", "duration": 10},
+ {"id": "ccccccccccc", "title": "[Private video]", "duration": null},
+ {"id": "ddddddddddd", "title": "[Deleted video]", "duration": null},
+ {"title": "No id", "duration": 5},
+ {"id": "bbbbbbbbbbb", "title": "Second", "duration": null}
+]}

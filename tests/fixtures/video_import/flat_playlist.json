@@ -1,0 +1,4 @@
+{"_type": "playlist", "id": "PLtest", "title": "Test Playlist", "entries": [
+ {"_type": "url", "id": "aaaaaaaaaaa", "title": "Test Video", "duration": 754},
+ {"_type": "url", "id": "bbbbbbbbbbb", "title": "Second Video", "duration": 3600}
+]}
