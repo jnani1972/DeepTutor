@@ -17,3 +17,15 @@ def fixture_json():
         return extract
 
     return make
+
+
+@pytest.fixture
+def png_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    image = Image.new("RGB", (64, 36), (200, 30, 30))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
