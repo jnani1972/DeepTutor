@@ -55,7 +55,7 @@ class FakeFileCapture:
 
 
 class Harness:
-    def __init__(self, tmp_path: Path, jpeg_of) -> None:
+    def __init__(self, tmp_path: Path, jpeg_of, *, store=None, index_path=None) -> None:
         self.calls: list = []
         self.kb_users: list = []
         self.listing = Listing(
@@ -66,7 +66,8 @@ class Harness:
         self.store = ImportJobStore(root=tmp_path / "vi")
         self.file_capture = FakeFileCapture(jpeg_of)
         self.runner = ImportRunner(
-            self.store,
+            store or self.store,
+            index_path=index_path,
             file_capture=self.file_capture,
             details=self.details,
             transcribe=self.transcribe,
@@ -350,4 +351,72 @@ async def test_transcription_failure_fails_only_that_video(h, jpeg_of):
     assert job.status is JobStatus.done
     assert _stages(job) == {"a": VideoStage.failed, "b": VideoStage.done}
     assert "stt down" in job.videos[0].error_detail
-    assert (h.store.video_dir(job.job_id, "a") / "audio.webm").exists()
+    # The job ended done, so nothing can retry the failed video: its media goes.
+    assert not (h.store.root / "work" / job.job_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancel_removes_captured_media(h, jpeg_of):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    h.runner.begin_capture(job.job_id, "b")
+    assert list((h.store.root / "work" / job.job_id).rglob("*.jpg"))
+
+    job = await h.runner.cancel(job.job_id)
+    assert job.status is JobStatus.cancelled
+    assert not (h.store.root / "work" / job.job_id).exists()
+    with pytest.raises(KeyError):
+        h.runner.sink(job.job_id, "b")
+
+
+def _user(uid: str, tmp_path: Path) -> CurrentUser:
+    return CurrentUser(uid, uid, "user", UserScope("user", uid, tmp_path / uid))
+
+
+@pytest.mark.asyncio
+async def test_jobs_are_scoped_to_their_owner(tmp_path, jpeg_of):
+    stores: dict[str, ImportJobStore] = {}
+
+    def scope_store():
+        uid = get_current_user_or_none().id
+        if uid not in stores:
+            stores[uid] = ImportJobStore(root=tmp_path / "scopes" / uid)
+        return stores[uid]
+
+    def harness():
+        return Harness(tmp_path, jpeg_of, store=scope_store, index_path=tmp_path / "index.json")
+
+    h = harness()
+    alice, bob = _user("alice", tmp_path), _user("bob", tmp_path)
+
+    token = set_current_user(alice)
+    try:
+        first = await h.runner.create(url=PLAYLIST_URL, kb_name="alice-course")
+        await h.play(first.job_id, "a", jpeg_of)
+        await h.play(first.job_id, "b", jpeg_of)
+        await h.runner.drain()
+        assert stores["alice"].load(first.job_id).status is JobStatus.done
+        interrupted_a = await h.runner.create(url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        h.runner.begin_capture(interrupted_a.job_id, "a")
+    finally:
+        reset_current_user(token)
+
+    token = set_current_user(bob)
+    try:
+        job = await h.runner.create(url=PLAYLIST_URL)
+        assert job.kb_name == "yt-my-list"
+        assert _stages(job) == {"a": VideoStage.queued, "b": VideoStage.queued}
+        with pytest.raises(KeyError):
+            await h.runner.pause(first.job_id)
+        with pytest.raises(KeyError):
+            h.runner.begin_capture(first.job_id, "a")
+        h.runner.begin_capture(job.job_id, "a")
+    finally:
+        reset_current_user(token)
+
+    fresh = harness()  # restart, with no user context
+    await fresh.runner.recover()
+    for uid, job_id in (("alice", interrupted_a.job_id), ("bob", job.job_id)):
+        recovered = stores[uid].load(job_id)
+        assert recovered.status is JobStatus.waiting_for_playback
+        assert recovered.videos[0].stage is VideoStage.queued

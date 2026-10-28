@@ -11,7 +11,7 @@ its saved video stages.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -20,6 +20,7 @@ import logging
 from pathlib import Path
 import re
 import shutil
+import threading
 import uuid
 
 from deeptutor.multi_user.context import (
@@ -28,7 +29,9 @@ from deeptutor.multi_user.context import (
     set_current_user,
 )
 from deeptutor.multi_user.models import CurrentUser, UserScope
+from deeptutor.multi_user.paths import SYSTEM_ROOT, get_current_path_service
 from deeptutor.reading.ingestion import TranscriptSegment, _probe_stt_configuration
+from deeptutor.services.file_io import atomic_write_json
 
 from .capture import CapturedFrame, CaptureResult, CaptureSink
 from .describe import describe_frames
@@ -198,10 +201,74 @@ def _write_notes(path: Path, markdown: str, video_dir: Path) -> None:
         pass
 
 
+StoreResolver = Callable[[], ImportJobStore]
+
+_scope_stores: dict[Path, ImportJobStore] = {}
+
+
+def current_scope_store() -> ImportJobStore:
+    """The job store of the current user's current workspace (cached per root)."""
+    root = get_current_path_service().get_workspace_feature_dir("video_import").resolve()
+    store = _scope_stores.get(root)
+    if store is None:
+        store = _scope_stores[root] = ImportJobStore(root)
+    return store
+
+
+def _purge_work(store: ImportJobStore, job_id: str) -> None:
+    shutil.rmtree(store.root / "work" / job_id, ignore_errors=True)
+
+
+class _ActiveIndex:
+    """``{job_id: store root}`` of jobs that may need recovery after a restart.
+
+    Job data stays in each owner's own workspace store; this small global file
+    only tells ``recover()`` where to look, since a restart has no user context.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._entries: dict[str, str] | None = None
+
+    def _load(self) -> dict[str, str]:
+        if self._entries is None:
+            try:
+                self._entries = json.loads(self.path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                self._entries = {}
+        return self._entries
+
+    def entries(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._load())
+
+    def update(self, job_id: str, root: Path, active: bool) -> None:
+        with self._lock:
+            entries = self._load()
+            if active == (job_id in entries):
+                return
+            if active:
+                entries[job_id] = str(root)
+            else:
+                del entries[job_id]
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(self.path, entries)
+
+
 class ImportRunner:
+    """One runner and one worker for the whole process (one job at a time on
+    the GPU), with each job's data kept in its owner's workspace store.
+
+    ``store`` is either a fixed store or a resolver returning the store of the
+    calling user's scope (the default). Every public method resolves the
+    caller's store, so a job id from another user or workspace raises
+    ``KeyError``.
+    """
+
     def __init__(
         self,
-        store: ImportJobStore,
+        store: ImportJobStore | StoreResolver = current_scope_store,
         *,
         file_capture: FileCapture,
         details=fetch_video_details,
@@ -211,8 +278,16 @@ class ImportRunner:
         switcher: ModelSwitcher,
         lister=list_target,
         folder_lister=list_media_folder,
+        index_path: Path | None = None,
     ) -> None:
-        self.store = store
+        if isinstance(store, ImportJobStore):
+            fixed = store
+            self._resolve_store: StoreResolver = lambda: fixed
+            index_path = index_path or fixed.root / "active_jobs.json"
+        else:
+            self._resolve_store = store
+            index_path = index_path or SYSTEM_ROOT / "video_import" / "active_jobs.json"
+        self._index = _ActiveIndex(index_path)
         self._file_capture = file_capture
         self._details = details
         self._transcribe = transcribe
@@ -221,8 +296,8 @@ class ImportRunner:
         self._switcher = switcher
         self._lister = lister
         self._folder_lister = folder_lister
-        self._sinks: dict[tuple[str, str], _TrackedSink] = {}
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._sinks: dict[tuple[str, str, str], _TrackedSink] = {}
+        self._queue: asyncio.Queue[tuple[ImportJobStore, str]] = asyncio.Queue()
         self._queued: set[str] = set()
         self._worker: asyncio.Task[None] | None = None
         self._running: str | None = None
@@ -251,6 +326,7 @@ class ImportRunner:
         video_ids: list[str] | None = None,
         kb_name: str | None = None,
     ) -> ImportJob:
+        store = self._resolve_store()
         target, listing = await self.preview(url=url, folder=folder)
         entries = listing.entries
         if video_ids is not None:
@@ -260,7 +336,7 @@ class ImportRunner:
             raise ValueError("Nothing to import")
         is_file = target.kind is TargetKind.FOLDER
 
-        jobs = await asyncio.to_thread(self.store.list) if target.playlist_id else []
+        jobs = await asyncio.to_thread(store.list) if target.playlist_id else []
         if not kb_name:
             previous = next(
                 (j for j in jobs if j.target.playlist_id == target.playlist_id), None
@@ -272,7 +348,7 @@ class ImportRunner:
             else:
                 kb_name = f"yt-{_slug(listing.title)}"
         done = (
-            await asyncio.to_thread(self.store.done_video_ids, target.playlist_id)
+            await asyncio.to_thread(store.done_video_ids, target.playlist_id)
             if target.playlist_id
             else set()
         )
@@ -301,33 +377,35 @@ class ImportRunner:
         )
         if not is_file and not self._has_capture_left(job):
             job.status = JobStatus.pending
-        await self._save(job)
+        await self._save(store, job)
         if job.status is JobStatus.pending:
-            self.start(job.job_id)
+            self._enqueue(store, job.job_id)
         return job
 
     # ── browser capture sessions ──────────────────────────────────────────
 
     def begin_capture(self, job_id: str, video_id: str) -> CaptureSink:
-        job = self.store.load(job_id)
+        store = self._resolve_store()
+        job = store.load(job_id)
         if job.status not in (JobStatus.waiting_for_playback, JobStatus.capturing):
             raise ValueError(f"Job is {job.status.value}, not waiting for playback")
         video = self._video(job, video_id)
         if video.stage not in (VideoStage.queued, VideoStage.capturing):
             raise ValueError(f"Video is {video.stage.value}, not queued")
-        key = (job_id, video_id)
-        sink = self._sinks.get(key) or _TrackedSink(self.store.video_dir(job_id, video_id))
+        key = (str(store.root), job_id, video_id)
+        sink = self._sinks.get(key) or _TrackedSink(store.video_dir(job_id, video_id))
         sink.reset()
         self._sinks[key] = sink
         video.stage = VideoStage.capturing
         video.error_code = video.error_detail = ""
         job.status = JobStatus.capturing
         job.updated_at = _now()
-        self.store.save(job)
+        store.save(job)
+        self._index.update(job_id, store.root, True)
         return sink
 
     def sink(self, job_id: str, video_id: str) -> CaptureSink:
-        return self._sinks[(job_id, video_id)]
+        return self._sinks[(str(self._resolve_store().root), job_id, video_id)]
 
     async def finish_capture(
         self,
@@ -339,8 +417,10 @@ class ImportRunner:
         player_duration: float,
         error_code: str | None = None,
     ) -> ImportJob:
-        sink = self._sinks[(job_id, video_id)]
-        job = await asyncio.to_thread(self.store.load, job_id)
+        store = self._resolve_store()
+        key = (str(store.root), job_id, video_id)
+        sink = self._sinks[key]
+        job = await asyncio.to_thread(store.load, job_id)
         video = self._video(job, video_id)
         incomplete = (
             not ended
@@ -365,23 +445,28 @@ class ImportRunner:
             )
             await asyncio.to_thread(_write_meta, sink.out_dir, result)
             video.stage = VideoStage.captured
-        del self._sinks[(job_id, video_id)]
+        del self._sinks[key]
         if self._has_capture_left(job):
             job.status = JobStatus.waiting_for_playback
-            await self._save(job)
+            await self._save(store, job)
         else:
             job.status = JobStatus.pending
-            await self._save(job)
-            self.start(job_id)
+            await self._save(store, job)
+            self._enqueue(store, job_id)
         return job
 
     # ── control ───────────────────────────────────────────────────────────
 
     def start(self, job_id: str) -> None:
+        store = self._resolve_store()
+        store.load(job_id)  # KeyError for a job outside the caller's scope
+        self._enqueue(store, job_id)
+
+    def _enqueue(self, store: ImportJobStore, job_id: str) -> None:
         if job_id in self._queued:
             return
         self._queued.add(job_id)
-        self._queue.put_nowait(job_id)
+        self._queue.put_nowait((store, job_id))
         if self._worker is None or self._worker.done():
             self._worker = asyncio.get_running_loop().create_task(self._work())
 
@@ -391,19 +476,21 @@ class ImportRunner:
 
     async def pause(self, job_id: str) -> ImportJob:
         """Pause a job; a running job stops at its next video or phase boundary."""
-        job = await asyncio.to_thread(self.store.load, job_id)
+        store = self._resolve_store()
+        job = await asyncio.to_thread(store.load, job_id)
         if job.status not in _PAUSABLE:
             raise ValueError(f"Job is {job.status.value} and cannot be paused")
         if job_id == self._running:
             self._pause_requested.add(job_id)
             return job
-        await self._drop_sinks(job)
+        await self._drop_sinks(store, job)
         job.status = JobStatus.paused
-        await self._save(job)
+        await self._save(store, job)
         return job
 
     async def resume(self, job_id: str) -> ImportJob:
-        job = await asyncio.to_thread(self.store.load, job_id)
+        store = self._resolve_store()
+        job = await asyncio.to_thread(store.load, job_id)
         if job_id == self._running and job_id in self._pause_requested:
             self._pause_requested.discard(job_id)
             return job
@@ -412,28 +499,38 @@ class ImportRunner:
         job.error_code = job.error_detail = ""
         if job.capture_mode is CaptureMode.browser and self._has_capture_left(job):
             job.status = JobStatus.waiting_for_playback
-            await self._save(job)
+            await self._save(store, job)
         else:
             job.status = JobStatus.pending
-            await self._save(job)
-            self.start(job_id)
+            await self._save(store, job)
+            self._enqueue(store, job_id)
         return job
 
     async def cancel(self, job_id: str) -> ImportJob:
-        job = await asyncio.to_thread(self.store.load, job_id)
+        store = self._resolve_store()
+        job = await asyncio.to_thread(store.load, job_id)
         if job.status in (JobStatus.done, JobStatus.cancelled):
             return job
-        await self._drop_sinks(job)
+        await self._drop_sinks(store, job)
         if job_id == self._running:
             self._cancel_requested.add(job_id)
             return job
         job.status = JobStatus.cancelled
-        await self._save(job)
+        await self._save(store, job)
         return job
 
     async def recover(self) -> None:
-        """Requeue work interrupted by a restart; capture sessions start over."""
-        for job in await asyncio.to_thread(self.store.list):
+        """Requeue work interrupted by a restart, across every user's scope.
+
+        Capture sessions start over: in-memory sinks do not survive a restart.
+        """
+        for job_id, root in (await asyncio.to_thread(self._index.entries)).items():
+            store = await asyncio.to_thread(ImportJobStore, Path(root))
+            try:
+                job = await asyncio.to_thread(store.load, job_id)
+            except KeyError:
+                await asyncio.to_thread(self._index.update, job_id, store.root, False)
+                continue
             changed = False
             for video in job.videos:
                 if video.stage is VideoStage.capturing:
@@ -449,22 +546,22 @@ class ImportRunner:
                 changed = changed or status is not job.status
                 job.status = status
             if changed:
-                await self._save(job)
+                await self._save(store, job)
             if job.status in _WORKER_STATUSES:
-                self.start(job.job_id)
+                self._enqueue(store, job.job_id)
 
     # ── worker ────────────────────────────────────────────────────────────
 
     async def _work(self) -> None:
         while True:
-            job_id = await self._queue.get()
+            store, job_id = await self._queue.get()
             self._queued.discard(job_id)
             self._running = job_id
             try:
-                job = await asyncio.to_thread(self.store.load, job_id)
+                job = await asyncio.to_thread(store.load, job_id)
                 if job.status in _WORKER_STATUSES:
                     with _owner_context(job):
-                        await self._process(job)
+                        await self._process(store, job)
             except Exception:
                 logger.exception("Video import job %s crashed", job_id)
             finally:
@@ -473,20 +570,20 @@ class ImportRunner:
                 self._cancel_requested.discard(job_id)
                 self._queue.task_done()
 
-    async def _process(self, job: ImportJob) -> None:
+    async def _process(self, store: ImportJobStore, job: ImportJob) -> None:
         restored = False
         try:
             if job.capture_mode is CaptureMode.file and self._at(job, VideoStage.queued):
                 job.status = JobStatus.capturing
-                await self._save(job)
+                await self._save(store, job)
                 for video in self._at(job, VideoStage.queued):
-                    if await self._halted(job):
+                    if await self._halted(store, job):
                         return
-                    await self._capture_file(job, video)
-            if await self._halted(job):
+                    await self._capture_file(store, job, video)
+            if await self._halted(store, job):
                 return
             job.status = JobStatus.processing
-            await self._save(job)
+            await self._save(store, job)
 
             if self._at(job, VideoStage.captured):
                 missing = _probe_stt_configuration()
@@ -494,23 +591,23 @@ class ImportRunner:
                     job.status = JobStatus.failed
                     job.error_code = "stt_not_configured"
                     job.error_detail = missing
-                    await self._save(job)
+                    await self._save(store, job)
                     return
                 await self._switcher.free_for_stt()
                 for video in self._at(job, VideoStage.captured):
-                    if await self._halted(job):
+                    if await self._halted(store, job):
                         return
-                    await self._transcribe_video(job, video)
-            if await self._halted(job):
+                    await self._transcribe_video(store, job, video)
+            if await self._halted(store, job):
                 return
 
             if self._at(job, VideoStage.transcribed):
                 await self._switcher.free_for_vision()
                 for video in self._at(job, VideoStage.transcribed):
-                    if await self._halted(job):
+                    if await self._halted(store, job):
                         return
-                    await self._describe_video(job, video)
-            if await self._halted(job):
+                    await self._describe_video(store, job, video)
+            if await self._halted(store, job):
                 return
 
             described = self._at(job, VideoStage.described)
@@ -518,11 +615,11 @@ class ImportRunner:
                 # Indexing needs the embedding model, which restore_chat reloads.
                 await self._switcher.restore_chat()
                 restored = True
-                notes = [self.store.notes_path(job.job_id, _entry(v)) for v in described]
+                notes = [store.notes_path(job.job_id, _entry(v)) for v in described]
                 await self._add_to_kb(job.kb_name, notes)
                 for video in described:
                     video.stage = VideoStage.done
-                await self._save(job)
+                await self._save(store, job)
 
             stages = [v.stage for v in job.videos]
             if VideoStage.done not in stages and VideoStage.failed in stages:
@@ -530,13 +627,13 @@ class ImportRunner:
                 job.error_code = "all_videos_failed"
             else:
                 job.status = JobStatus.done
-            await self._save(job)
+            await self._save(store, job)
         except Exception as exc:
             logger.exception("Video import job %s failed", job.job_id)
             job.status = JobStatus.failed
             job.error_code = "processing_failed"
             job.error_detail = str(exc)
-            await self._save(job)
+            await self._save(store, job)
         finally:
             if not restored:
                 try:
@@ -544,18 +641,20 @@ class ImportRunner:
                 except Exception:
                     logger.warning("Could not restore the chat models", exc_info=True)
 
-    async def _halted(self, job: ImportJob) -> bool:
+    async def _halted(self, store: ImportJobStore, job: ImportJob) -> bool:
         if job.job_id in self._cancel_requested:
             job.status = JobStatus.cancelled
         elif job.job_id in self._pause_requested:
             job.status = JobStatus.paused
         else:
             return False
-        await self._save(job)
+        await self._save(store, job)
         return True
 
-    async def _capture_file(self, job: ImportJob, video: VideoState) -> None:
-        video_dir = await asyncio.to_thread(self.store.video_dir, job.job_id, video.video_id)
+    async def _capture_file(
+        self, store: ImportJobStore, job: ImportJob, video: VideoState
+    ) -> None:
+        video_dir = await asyncio.to_thread(store.video_dir, job.job_id, video.video_id)
         # A stale partial capture would otherwise be appended to.
         await asyncio.to_thread(_clear_dir, video_dir)
         try:
@@ -576,10 +675,12 @@ class ImportRunner:
                 self._fail(video, "capture_failed", str(exc))
             else:
                 video.stage = VideoStage.captured
-        await self._save(job)
+        await self._save(store, job)
 
-    async def _transcribe_video(self, job: ImportJob, video: VideoState) -> None:
-        video_dir = await asyncio.to_thread(self.store.video_dir, job.job_id, video.video_id)
+    async def _transcribe_video(
+        self, store: ImportJobStore, job: ImportJob, video: VideoState
+    ) -> None:
+        video_dir = await asyncio.to_thread(store.video_dir, job.job_id, video.video_id)
         audio = video_dir / "audio.webm"
         try:
             has_audio = await asyncio.to_thread(lambda: audio.exists() and audio.stat().st_size > 0)
@@ -591,10 +692,12 @@ class ImportRunner:
             await asyncio.to_thread(_save_segments, video_dir, segments)
             video.stage = VideoStage.transcribed
             video.speech_cues = len(segments)
-        await self._save(job)
+        await self._save(store, job)
 
-    async def _describe_video(self, job: ImportJob, video: VideoState) -> None:
-        video_dir = await asyncio.to_thread(self.store.video_dir, job.job_id, video.video_id)
+    async def _describe_video(
+        self, store: ImportJobStore, job: ImportJob, video: VideoState
+    ) -> None:
+        video_dir = await asyncio.to_thread(store.video_dir, job.job_id, video.video_id)
         try:
             meta, segments, frames = await asyncio.to_thread(_load_described_inputs, video_dir)
             frame_notes = await self._describe(frames)
@@ -607,7 +710,7 @@ class ImportRunner:
                 chapters=[Chapter(c["t_seconds"], c["title"]) for c in meta["chapters"]],
                 description=meta["description"],
             )
-            path = self.store.notes_path(job.job_id, entry)
+            path = store.notes_path(job.job_id, entry)
             await asyncio.to_thread(_write_notes, path, markdown, video_dir)
         except Exception as exc:
             logger.warning("Describing %s failed", video.video_id, exc_info=True)
@@ -615,17 +718,23 @@ class ImportRunner:
         else:
             video.stage = VideoStage.described
             video.frame_notes = len(frame_notes)
-        await self._save(job)
+        await self._save(store, job)
 
     # ── helpers ───────────────────────────────────────────────────────────
 
-    async def _save(self, job: ImportJob) -> None:
+    async def _save(self, store: ImportJobStore, job: ImportJob) -> None:
         job.updated_at = _now()
-        await asyncio.to_thread(self.store.save, job)
+        await asyncio.to_thread(store.save, job)
+        await asyncio.to_thread(
+            self._index.update, job.job_id, store.root, job.status in _PAUSABLE
+        )
+        if job.status in (JobStatus.done, JobStatus.cancelled):
+            # Nothing can retry a finished or cancelled job: only notes persist.
+            await asyncio.to_thread(_purge_work, store, job.job_id)
 
-    async def _drop_sinks(self, job: ImportJob) -> None:
+    async def _drop_sinks(self, store: ImportJobStore, job: ImportJob) -> None:
         for video in job.videos:
-            sink = self._sinks.pop((job.job_id, video.video_id), None)
+            sink = self._sinks.pop((str(store.root), job.job_id, video.video_id), None)
             if sink is not None:
                 await asyncio.to_thread(sink.reset)
             if video.stage is VideoStage.capturing:
@@ -657,11 +766,8 @@ _runner: ImportRunner | None = None
 
 
 def get_import_runner() -> ImportRunner:
+    """The process-wide runner: one worker, stores resolved per caller scope."""
     global _runner
     if _runner is None:
-        _runner = ImportRunner(
-            ImportJobStore(),
-            file_capture=FileCapture(),
-            switcher=ModelSwitcher(),
-        )
+        _runner = ImportRunner(file_capture=FileCapture(), switcher=ModelSwitcher())
     return _runner
