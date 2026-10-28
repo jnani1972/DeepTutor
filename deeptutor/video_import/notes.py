@@ -32,6 +32,10 @@ def _clock(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
 def build_notes_markdown(
     entry: PlaylistEntry,
     playlist_title: str,
@@ -42,7 +46,7 @@ def build_notes_markdown(
     description: str = "",
 ) -> str:
     lines = [
-        f"# {entry.title}",
+        f"# {_one_line(entry.title)}",
         "",
         f"Playlist: {playlist_title} · Video {entry.position} · "
         f"Duration {_clock(entry.duration_seconds)}",
@@ -50,7 +54,7 @@ def build_notes_markdown(
     ]
     if chapters:
         lines += ["## Chapters"]
-        lines += [f"[{_clock(c.t_seconds)}] {c.title}" for c in chapters]
+        lines += [f"[{_clock(c.t_seconds)}] {_one_line(c.title)}" for c in chapters]
         lines.append("")
     description = description.strip()[:_DESCRIPTION_LIMIT].strip()
     if description:
@@ -58,10 +62,11 @@ def build_notes_markdown(
     lines.append("## Timeline")
     if not segments:
         lines.append("No speech was detected in this video.")
-    events = [(s.start_seconds, 0, f"speech: {s.text}") for s in segments]
-    events += [(f.t_seconds, 1, f"screen: {f.text}") for f in frames]
+    events = [(s.start_seconds, 0, "speech", _one_line(s.text)) for s in segments]
+    events += [(f.t_seconds, 1, "screen", _one_line(f.text)) for f in frames]
+    events = [e for e in events if e[3]]
     events.sort(key=lambda e: (e[0], e[1]))
-    lines += [f"[{_clock(t)}] {text}" for t, _, text in events]
+    lines += [f"[{_clock(t)}] {kind}: {text}" for t, _, kind, text in events]
     return "\n".join(lines) + "\n"
 
 

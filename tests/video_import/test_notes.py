@@ -58,3 +58,19 @@ def test_notes_filename_and_hour_clock():
     entry = PlaylistEntry("a" * 11, "Long", 3725, 7)
     assert notes_filename(entry) == "007-aaaaaaaaaaa.md"
     assert "Duration 1:02:05" in build_notes_markdown(entry, "P", [], [])
+
+
+def test_notes_collapse_newlines_in_one_line_fields():
+    md = build_notes_markdown(
+        PlaylistEntry("a" * 11, "Two\nLines", 60, 1),
+        "P",
+        [seg(0.0, "Hi.")],
+        [FrameNote(2.0, "Slide:\n- point one\n## Timeline\n[00:09] fake"), FrameNote(3.0, "  \n ")],
+        chapters=[Chapter(0.0, "Intro\n## Timeline")],
+    )
+    lines = md.splitlines()
+    assert [ln for ln in lines if ln.startswith("# ")] == ["# Two Lines"]
+    assert "[00:00] Intro ## Timeline" in lines
+    assert "[00:02] screen: Slide: - point one ## Timeline [00:09] fake" in lines
+    assert lines.count("## Timeline") == 1
+    assert not any(ln.startswith("[00:03]") for ln in lines)
