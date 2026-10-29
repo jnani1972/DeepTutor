@@ -37,3 +37,6 @@ croniter>=6.0.0,<7.0.0
 # Process-tree memory readings behind /api/system/memory. Imported lazily
 # with a /proc fallback, so it is soft rather than required.
 psutil>=5.9.0,<8.0.0
+
+# --- YouTube video import (metadata listing only; yt-dlp never downloads media) ---
+-r video-import.txt

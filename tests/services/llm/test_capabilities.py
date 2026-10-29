@@ -172,3 +172,7 @@ def test_models_prefix_does_not_change_other_vendor_verdicts() -> None:
     assert supports_vision("custom", "openai/gpt-3.5-turbo") is False
     # The bare id keeps resolving exactly as before.
     assert supports_vision("custom", "gemini-2.5-flash") is True
+
+
+def test_qwen3_vl_on_lm_studio_supports_vision() -> None:
+    assert supports_vision("lm_studio", "qwen/qwen3-vl-8b") is True

@@ -320,6 +320,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"PocketBase startup check failed: {e}")
 
+    # Resume video-import jobs that were running when the server last stopped.
+    # Imported lazily: the optional ``video-import`` extra may be absent.
+    try:
+        from deeptutor.video_import.runner import get_import_runner
+
+        await get_import_runner().recover()
+    except Exception:
+        logger.warning("Video import recovery failed", exc_info=True)
+
     # Migrate any v1 memory files (PROFILE.md / SOUL.md / SUMMARY.md) into a
     # backup folder so the v2 three-layer subsystem starts clean.
     try:
@@ -569,6 +578,7 @@ from deeptutor.api.routers import (
     system,
     task_board,
     unified_ws,
+    video_import,
     video_learning,
     visualizers,
     voice,
@@ -655,6 +665,12 @@ app.include_router(
     reading_extensions.router,
     prefix="/api/reading",
     tags=["reading-extensions"],
+    dependencies=_auth,
+)
+app.include_router(
+    video_import.router,
+    prefix="/api/video-import",
+    tags=["video-import"],
     dependencies=_auth,
 )
 app.include_router(memory.router, prefix="/api/memory", tags=["memory"], dependencies=_auth)

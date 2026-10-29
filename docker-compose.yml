@@ -208,9 +208,44 @@ services:
     networks:
       - deeptutor-network
 
+  # ============================================
+  # Speaches — optional local speech-to-text (OpenAI-compatible Whisper)
+  # Used by video import / media transcription. Needs an NVIDIA GPU and the
+  # NVIDIA container runtime. Start only this service with:
+  #   python scripts/docker_compose.py up -d speaches
+  # Then set Settings -> Voice -> STT to OpenAI-compatible,
+  # base URL http://speaches:8000/v1.
+  # ============================================
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cuda
+    container_name: speaches
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # int8 keeps Pascal GPUs (compute 6.1, no fast fp16) working.
+      - WHISPER__COMPUTE_TYPE=int8
+      - WHISPER__INFERENCE_DEVICE=cuda
+      # Free the GPU this many seconds after the last request (-1 = never).
+      - STT_MODEL_TTL=120
+    volumes:
+      - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - deeptutor-network
+
 # ============================================
 # Networks
 # ============================================
 networks:
   deeptutor-network:
     driver: bridge
+
+volumes:
+  hf-hub-cache:

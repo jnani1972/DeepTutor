@@ -1,0 +1,2 @@
+# YouTube playlist import (yt-dlp is used for metadata listing only).
+yt-dlp>=2025.1.1
