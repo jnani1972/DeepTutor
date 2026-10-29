@@ -669,7 +669,7 @@ app.include_router(
 )
 app.include_router(
     video_import.router,
-    prefix="/api/v1/video-import",
+    prefix="/api/video-import",
     tags=["video-import"],
     dependencies=_auth,
 )

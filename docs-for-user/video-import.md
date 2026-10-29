@@ -84,7 +84,7 @@ Frames with no instructional content (talking head, blank screen) produce no not
 
 ### API
 
-All routes live under `/api/v1/video-import` and use the same sign-in as the rest of the app. Responses are job progress only; notes are never returned.
+All routes live under `/api/video-import` and use the same sign-in as the rest of the app. Responses are job progress only; notes are never returned.
 
 | Route | Purpose |
 | --- | --- |

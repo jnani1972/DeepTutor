@@ -98,12 +98,12 @@ def runner() -> FakeRunner:
 @pytest.fixture
 def client(runner: FakeRunner) -> TestClient:
     app = FastAPI()
-    app.include_router(router_module.router, prefix="/api/v1/video-import")
+    app.include_router(router_module.router, prefix="/api/video-import")
     app.dependency_overrides[router_module.get_runner] = lambda: runner
     return TestClient(app)
 
 
-BASE = "/api/v1/video-import"
+BASE = "/api/video-import"
 
 
 def _no_note_text(payload) -> None:
@@ -215,7 +215,7 @@ def test_app_boots_without_yt_dlp():
         sys.modules["yt_dlp"] = None
         sys.modules["yt_dlp.utils"] = None
         import deeptutor.api.main as main
-        assert "/api/v1/video-import/preview" in main.app.openapi()["paths"]
+        assert "/api/video-import/preview" in main.app.openapi()["paths"]
         assert "deeptutor.video_import.listing" not in sys.modules
         """
     )
