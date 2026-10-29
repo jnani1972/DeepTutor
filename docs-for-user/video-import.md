@@ -112,6 +112,27 @@ deeptutor video-import pause|resume|cancel JOB_ID
 
 Browser capture itself is web-only. The CLI runs folder jobs end to end and waits for them to finish.
 
+### Web: browser capture
+
+Open `/learning/deep-import`, paste a YouTube URL (or a workspace folder path), pick videos, then start. On the capture page:
+
+1. Click **Start: share this tab**.
+2. When the browser asks, choose this tab and keep **Also share tab audio** on.
+3. Keep the window visible.
+
+The videos play one at a time and stay audible to you.
+
+- **Upload failures.** A failed audio or frame upload is retried twice. If a video still loses an audio chunk, or 5 or more frame uploads fail, the page shows the error with **Retry this video**. Nothing is sent as complete, and the retry captures the video again from the start.
+- **Sharing stopped.** If you stop sharing, the current video is re-queued and captured again when you share once more.
+
+### Ads during capture
+
+Ads inside the embedded player are filtered heuristically: while an ad plays, the main video clock does not advance.
+
+- **Pre-roll ads.** Recording and frame sampling start only after the video's own clock has advanced. Pre-roll ads are therefore not captured.
+- **Mid-roll ads, frames.** Detection needs about 2 s of a stalled clock. Frames are held for 2.5 s before upload, so frames from that stall window are dropped.
+- **Mid-roll ads, audio.** Audio from the stall window is already recorded. Up to about 2 s of mid-roll ad audio may enter the transcript, and the timestamps after each such ad can be shifted by about 2 s.
+
 ## Running the fork image (switching from the GHCR stack)
 
 `compose.yaml` runs the upstream image `ghcr.io/hkuds/deeptutor:latest`, which does not contain video import. `docker-compose.yml` builds the fork (`deeptutor-deeptutor:latest`), joins network `deeptutor-network`, and includes the `speaches` service. No script change is needed: `scripts/docker_compose.py` passes its arguments to `docker compose`, so naming the file selects the stack.

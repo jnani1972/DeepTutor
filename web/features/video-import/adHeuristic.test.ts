@@ -22,6 +22,15 @@ describe("AdDetector", () => {
     expect(detector.update({ wallMs: 2000, state: PLAYING, currentTime: 5.2 })).toBe("ad");
   });
 
+  it("exposes when the ad's stall window began", () => {
+    const detector = new AdDetector();
+    detector.update({ wallMs: 1000, state: PLAYING, currentTime: 3 });
+    detector.update({ wallMs: 1500, state: PLAYING, currentTime: 3.5 });
+    expect(detector.adStartedAtMs).toBeNull();
+    detector.update({ wallMs: 3600, state: PLAYING, currentTime: 3.5 });
+    expect(detector.adStartedAtMs).toBe(1500);
+  });
+
   it("returns to record once the clock advances again", () => {
     const detector = new AdDetector();
     detector.update({ wallMs: 0, state: PLAYING, currentTime: 0 });

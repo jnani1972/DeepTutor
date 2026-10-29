@@ -5562,5 +5562,22 @@
   "When the browser asks, choose this tab.": "Gdy przeglądarka zapyta, wybierz tę kartę.",
   "Workspace folder": "Folder obszaru roboczego",
   "{{count}} frame uploads failed for this video.": "Nieudane przesyłanie klatek dla tego filmu: {{count}}.",
-  "{{count}} selected · total {{duration}}": "Wybrano: {{count}} · łącznie {{duration}}"
+  "{{count}} selected · total {{duration}}": "Wybrano: {{count}} · łącznie {{duration}}",
+  "{{count}} frame uploads failed": "Nieudane przesyłanie klatek: {{count}}",
+  "deep_import.status.pending": "Oczekuje",
+  "deep_import.status.capturing": "Przechwytywanie",
+  "deep_import.status.processing": "Przetwarzanie",
+  "deep_import.status.paused": "Wstrzymano",
+  "deep_import.status.waiting_for_playback": "Oczekuje na odtwarzanie",
+  "deep_import.status.done": "Gotowe",
+  "deep_import.status.failed": "Niepowodzenie",
+  "deep_import.status.cancelled": "Anulowano",
+  "deep_import.stage.queued": "W kolejce",
+  "deep_import.stage.capturing": "Przechwytywanie",
+  "deep_import.stage.captured": "Przechwycono",
+  "deep_import.stage.transcribed": "Przetranskrybowano",
+  "deep_import.stage.described": "Opisano",
+  "deep_import.stage.done": "Gotowe",
+  "deep_import.stage.skipped": "Pominięto",
+  "deep_import.stage.failed": "Niepowodzenie"
 }

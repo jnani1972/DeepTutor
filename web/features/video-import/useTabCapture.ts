@@ -2,45 +2,24 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { AdDetector } from "./adHeuristic";
 import { type CaptureSession, uploadAudioChunk, uploadFrame } from "./api";
-import { FreezeDetector } from "./freezeDetector";
+import type { CaptureResult } from "./captureFlow";
+import {
+  type CapturePlayer,
+  type GrabbedFrame,
+  type RecorderLike,
+  VideoCaptureSession,
+} from "./captureSession";
 
-/** The subset of the YouTube player the capture loop reads. */
-export interface CapturePlayer {
-  getCurrentTime(): number;
-  getDuration(): number;
-  getPlayerState?(): number;
-}
-
-export interface CaptureStats {
-  adSeconds: number;
-  failedFrames: number;
-}
+export type { CapturePlayer } from "./captureSession";
 
 export const NO_AUDIO_TRACK = "no_audio_track";
 
 const AUDIO_MIME = "audio/webm;codecs=opus";
 const AD_TICK_MS = 500;
-const PLAYING = 1;
 const FRAME_CHANGE_THRESHOLD = 0.004;
 const SIGNATURE_W = 32;
 const SIGNATURE_H = 18;
-
-interface ActiveVideo {
-  videoId: string;
-  player: CapturePlayer;
-  recorder: MediaRecorder | null;
-  ads: AdDetector;
-  freeze: FreezeDetector;
-  inAd: boolean;
-  audioChain: Promise<void>;
-  audioFailed: boolean;
-  frameBusy: boolean;
-  failedFrames: number;
-  lastSignature: Uint8Array | null;
-  timers: number[];
-}
 
 export interface UseTabCaptureOptions {
   jobId: string;
@@ -49,6 +28,8 @@ export interface UseTabCaptureOptions {
   onSharingEnded?: () => void;
   /** An audio chunk could not be uploaded even after retries. */
   onAudioFailure?: (error: Error) => void;
+  /** The current video reached the failed-frame-upload limit. */
+  onFrameFailureLimit?: (failedFrames: number) => void;
 }
 
 function frameSignature(source: HTMLCanvasElement, scratch: HTMLCanvasElement): Uint8Array {
@@ -75,17 +56,43 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Adapt a MediaRecorder so `stop()` resolves after its final chunk was delivered. */
+function mediaRecorder(stream: MediaStream, onData: (chunk: Blob) => void): RecorderLike {
+  const recorder = new MediaRecorder(new MediaStream(stream.getAudioTracks()), {
+    mimeType: AUDIO_MIME,
+  });
+  recorder.ondataavailable = (event) => onData(event.data);
+  return {
+    get state() {
+      return recorder.state;
+    },
+    start: (timesliceMs) => recorder.start(timesliceMs),
+    pause: () => recorder.pause(),
+    resume: () => recorder.resume(),
+    stop: () =>
+      new Promise<void>((resolve) => {
+        if (recorder.state === "inactive") {
+          resolve();
+          return;
+        }
+        recorder.addEventListener("stop", () => resolve(), { once: true });
+        recorder.stop();
+      }),
+  };
+}
+
 /**
- * Shares the current tab once (`getDisplayMedia` with tab audio), then for each
- * attached video records the tab audio (webm/opus, uploaded per timeslice) and
- * uploads a JPEG of the player's rect every sample period. While the
- * `AdDetector` reports an ad, the recorder is paused and frames are not sent.
+ * Shares the current tab once (`getDisplayMedia` with tab audio). For each
+ * attached video a `VideoCaptureSession` records the tab audio (webm/opus,
+ * uploaded per timeslice) and samples a JPEG of the player's rect every sample
+ * period, with pre-roll and ad gating (see captureSession.ts).
  */
 export function useTabCapture({
   jobId,
   playerElement,
   onSharingEnded,
   onAudioFailure,
+  onFrameFailureLimit,
 }: UseTabCaptureOptions) {
   const [sharing, setSharing] = useState(false);
   const [audioTrack, setAudioTrack] = useState(false);
@@ -98,15 +105,21 @@ export function useTabCapture({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const scratchRef = useRef<HTMLCanvasElement | null>(null);
-  const activeRef = useRef<ActiveVideo | null>(null);
+  const sessionRef = useRef<VideoCaptureSession | null>(null);
+  const timersRef = useRef<number[]>([]);
   const stoppingRef = useRef(false);
   const playerElementRef = useRef(playerElement);
-  const callbacksRef = useRef({ onSharingEnded, onAudioFailure });
+  const callbacksRef = useRef({ onSharingEnded, onAudioFailure, onFrameFailureLimit });
 
   useEffect(() => {
     playerElementRef.current = playerElement;
-    callbacksRef.current = { onSharingEnded, onAudioFailure };
+    callbacksRef.current = { onSharingEnded, onAudioFailure, onFrameFailureLimit };
   });
+
+  const clearTimers = () => {
+    timersRef.current.forEach((timer) => window.clearInterval(timer));
+    timersRef.current = [];
+  };
 
   const releaseStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -118,18 +131,9 @@ export function useTabCapture({
     setSharing(false);
   }, []);
 
-  const clearTimers = (active: ActiveVideo) => {
-    active.timers.forEach((timer) => window.clearInterval(timer));
-    active.timers = [];
-  };
-
   const stop = useCallback(() => {
     stoppingRef.current = true;
-    const active = activeRef.current;
-    if (active) {
-      clearTimers(active);
-      if (active.recorder && active.recorder.state !== "inactive") active.recorder.stop();
-    }
+    clearTimers();
     releaseStream();
   }, [releaseStream]);
 
@@ -185,161 +189,93 @@ export function useTabCapture({
     setSharing(true);
   }, [releaseStream]);
 
+  /** Crop the shared tab to the player element and encode a JPEG (quality 0.8). */
   const grabFrame = useCallback(
-    (active: ActiveVideo) => {
-      const video = videoRef.current;
-      const element = playerElementRef.current;
-      if (!video || !element || !video.videoWidth || active.frameBusy) return;
-      const state = active.player.getPlayerState?.();
-      if (active.inAd || state !== PLAYING) return;
-
-      const rect = element.getBoundingClientRect();
-      const scale = video.videoWidth / Math.max(1, window.innerWidth);
-      const canvas = (canvasRef.current ??= document.createElement("canvas"));
-      const scratch = (scratchRef.current ??= document.createElement("canvas"));
-      canvas.width = Math.max(1, Math.round(rect.width * scale));
-      canvas.height = Math.max(1, Math.round(rect.height * scale));
-      const context = canvas.getContext("2d");
-      if (!context) return;
-      context.drawImage(
-        video,
-        rect.left * scale,
-        rect.top * scale,
-        canvas.width,
-        canvas.height,
-        0,
-        0,
-        canvas.width,
-        canvas.height,
-      );
-      const t = Number(active.player.getCurrentTime()) || 0;
-      const signature = frameSignature(canvas, scratch);
-      const changed =
-        !active.lastSignature ||
-        signatureDistance(signature, active.lastSignature) > FRAME_CHANGE_THRESHOLD;
-      active.lastSignature = signature;
-      setFrozen(
-        active.freeze.update({
-          hidden: document.visibilityState === "hidden",
-          frameChanged: changed,
-          currentTime: t,
-        }),
-      );
-
-      active.frameBusy = true;
-      canvas.toBlob(
-        (blob) => {
-          if (!blob || activeRef.current !== active) {
-            active.frameBusy = false;
-            return;
-          }
-          uploadFrame(jobId, active.videoId, t, blob)
-            .catch(() => {
-              active.failedFrames += 1;
-              setFailedFrames(active.failedFrames);
-            })
-            .finally(() => {
-              active.frameBusy = false;
-            });
-        },
-        "image/jpeg",
-        0.8,
-      );
-    },
-    [jobId],
+    (player: CapturePlayer, last: { signature: Uint8Array | null }) =>
+      async (): Promise<GrabbedFrame | null> => {
+        const video = videoRef.current;
+        const element = playerElementRef.current;
+        if (!video || !element || !video.videoWidth) return null;
+        const rect = element.getBoundingClientRect();
+        const scale = video.videoWidth / Math.max(1, window.innerWidth);
+        const canvas = (canvasRef.current ??= document.createElement("canvas"));
+        const scratch = (scratchRef.current ??= document.createElement("canvas"));
+        canvas.width = Math.max(1, Math.round(rect.width * scale));
+        canvas.height = Math.max(1, Math.round(rect.height * scale));
+        const context = canvas.getContext("2d");
+        if (!context) return null;
+        context.drawImage(
+          video,
+          rect.left * scale,
+          rect.top * scale,
+          canvas.width,
+          canvas.height,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
+        const t = Number(player.getCurrentTime()) || 0;
+        const signature = frameSignature(canvas, scratch);
+        const changed =
+          !last.signature ||
+          signatureDistance(signature, last.signature) > FRAME_CHANGE_THRESHOLD;
+        last.signature = signature;
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, "image/jpeg", 0.8),
+        );
+        return blob ? { t, blob, changed } : null;
+      },
+    [],
   );
 
-  /** Begin recording one video. `capture/start` must already have succeeded. */
+  /** Begin capturing one video. `capture/start` must already have succeeded. */
   const attach = useCallback(
-    (videoId: string, player: CapturePlayer, session: CaptureSession) => {
+    (videoId: string, player: CapturePlayer, capture: CaptureSession) => {
       const stream = streamRef.current;
-      if (!stream || activeRef.current) return;
-      const active: ActiveVideo = {
-        videoId,
-        player,
-        recorder: null,
-        ads: new AdDetector(),
-        freeze: new FreezeDetector(),
-        inAd: false,
-        audioChain: Promise.resolve(),
-        audioFailed: false,
-        frameBusy: false,
-        failedFrames: 0,
-        lastSignature: null,
-        timers: [],
-      };
-      activeRef.current = active;
+      if (!stream || sessionRef.current) return;
       setFrozen(false);
       setInAd(false);
       setFailedFrames(0);
-
-      // A fresh recorder per video so each upload stream starts with a webm header.
-      const recorder = new MediaRecorder(new MediaStream(stream.getAudioTracks()), {
-        mimeType: AUDIO_MIME,
+      const session = new VideoCaptureSession({
+        player,
+        // A fresh recorder per video so each upload stream starts with a webm header.
+        timesliceMs: capture.audio_timeslice_ms || 5000,
+        createRecorder: (onData) => mediaRecorder(stream, onData),
+        uploadAudio: (chunk) => uploadAudioChunk(jobId, videoId, chunk),
+        uploadFrame: (t, blob) => uploadFrame(jobId, videoId, t, blob),
+        grabFrame: grabFrame(player, { signature: null }),
+        isHidden: () => document.visibilityState === "hidden",
+        now: () => performance.now(),
+        onAudioFailure: (failure) => callbacksRef.current.onAudioFailure?.(failure),
+        onFrameFailureLimit: (count) => callbacksRef.current.onFrameFailureLimit?.(count),
+        onStatus: (status) => {
+          setInAd(status.inAd);
+          setFrozen(status.frozen);
+          setFailedFrames(status.failedFrames);
+        },
       });
-      recorder.ondataavailable = (event) => {
-        if (!event.data.size) return;
-        const chunk = event.data;
-        active.audioChain = active.audioChain.then(async () => {
-          if (active.audioFailed) return;
-          try {
-            await uploadAudioChunk(jobId, videoId, chunk);
-          } catch (caught) {
-            active.audioFailed = true;
-            callbacksRef.current.onAudioFailure?.(
-              caught instanceof Error ? caught : new Error(String(caught)),
-            );
-          }
-        });
-      };
-      recorder.start(session.audio_timeslice_ms || 5000);
-      active.recorder = recorder;
-
-      active.timers.push(
-        window.setInterval(() => {
-          const verdict = active.ads.update({
-            wallMs: performance.now(),
-            state: Number(player.getPlayerState?.() ?? -1),
-            currentTime: Number(player.getCurrentTime()) || 0,
-          });
-          const ad = verdict === "ad";
-          if (ad !== active.inAd) {
-            active.inAd = ad;
-            setInAd(ad);
-          }
-          if (ad && recorder.state === "recording") recorder.pause();
-          else if (!ad && recorder.state === "paused") recorder.resume();
-        }, AD_TICK_MS),
+      sessionRef.current = session;
+      timersRef.current.push(
+        window.setInterval(() => session.tickAd(), AD_TICK_MS),
         window.setInterval(
-          () => grabFrame(active),
-          Math.max(250, (session.sample_seconds || 1) * 1000),
+          () => void session.tickFrame(),
+          Math.max(250, (capture.sample_seconds || 1) * 1000),
         ),
       );
     },
     [grabFrame, jobId],
   );
 
-  /** Stop recording the current video and wait until every audio chunk is uploaded. */
-  const detach = useCallback(async (): Promise<CaptureStats & { audioFailed: boolean }> => {
-    const active = activeRef.current;
-    if (!active) return { adSeconds: 0, failedFrames: 0, audioFailed: false };
-    clearTimers(active);
-    const recorder = active.recorder;
-    if (recorder && recorder.state !== "inactive") {
-      await new Promise<void>((resolve) => {
-        recorder.addEventListener("stop", () => resolve(), { once: true });
-        recorder.stop();
-      });
-    }
-    await active.audioChain;
-    activeRef.current = null;
+  /** Stop the current video and wait until its final audio chunk and every frame are uploaded. */
+  const detach = useCallback(async (): Promise<CaptureResult> => {
+    clearTimers();
+    const session = sessionRef.current;
+    sessionRef.current = null;
     setInAd(false);
     setFrozen(false);
-    return {
-      adSeconds: Math.round(active.ads.adSeconds * 10) / 10,
-      failedFrames: active.failedFrames,
-      audioFailed: active.audioFailed,
-    };
+    if (!session) return { adSeconds: 0, audioFailed: false, failedFrames: 0 };
+    return session.detach();
   }, []);
 
   const isSharing = useCallback(() => streamRef.current !== null, []);

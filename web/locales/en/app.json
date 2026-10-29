@@ -5562,5 +5562,6 @@
   "deep_import.stage.described": "Described",
   "deep_import.stage.done": "Done",
   "deep_import.stage.skipped": "Skipped",
-  "deep_import.stage.failed": "Failed"
+  "deep_import.stage.failed": "Failed",
+  "{{count}} frame uploads failed": "{{count}} frame uploads failed"
 }

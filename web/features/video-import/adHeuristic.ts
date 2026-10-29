@@ -19,6 +19,8 @@ const STALL_WINDOW_MS = 2000;
 
 export class AdDetector {
   adSeconds = 0;
+  /** Wall time the current (or last) ad's stall window began. */
+  adStartedAtMs: number | null = null;
   private mode: AdVerdict = "record";
   private anchor: { wallMs: number; currentTime: number } | null = null;
   private lastWallMs: number | null = null;
@@ -47,6 +49,7 @@ export class AdDetector {
     if (this.mode === "record" && sample.wallMs - this.anchor.wallMs >= STALL_WINDOW_MS) {
       // The stall window itself was ad time too.
       this.adSeconds += (sample.wallMs - this.anchor.wallMs) / 1000;
+      this.adStartedAtMs = this.anchor.wallMs;
       this.mode = "ad";
     }
     return this.mode;

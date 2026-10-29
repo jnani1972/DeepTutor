@@ -5562,5 +5562,22 @@
   "When the browser asks, choose this tab.": "Коли браузер запитає, виберіть цю вкладку.",
   "Workspace folder": "Тека робочого простору",
   "{{count}} frame uploads failed for this video.": "Не вдалося завантажити кадрів для цього відео: {{count}}.",
-  "{{count}} selected · total {{duration}}": "Вибрано: {{count}} · загалом {{duration}}"
+  "{{count}} selected · total {{duration}}": "Вибрано: {{count}} · загалом {{duration}}",
+  "{{count}} frame uploads failed": "Не вдалося завантажити кадрів: {{count}}",
+  "deep_import.status.pending": "Очікує",
+  "deep_import.status.capturing": "Захоплення",
+  "deep_import.status.processing": "Обробка",
+  "deep_import.status.paused": "Призупинено",
+  "deep_import.status.waiting_for_playback": "Очікує відтворення",
+  "deep_import.status.done": "Готово",
+  "deep_import.status.failed": "Помилка",
+  "deep_import.status.cancelled": "Скасовано",
+  "deep_import.stage.queued": "У черзі",
+  "deep_import.stage.capturing": "Захоплення",
+  "deep_import.stage.captured": "Захоплено",
+  "deep_import.stage.transcribed": "Транскрибовано",
+  "deep_import.stage.described": "Описано",
+  "deep_import.stage.done": "Готово",
+  "deep_import.stage.skipped": "Пропущено",
+  "deep_import.stage.failed": "Помилка"
 }

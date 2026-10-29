@@ -18,7 +18,9 @@ import {
   startCapture,
 } from "./api";
 import {
+  type CaptureOutcome,
   TERMINAL_JOB_STATUSES,
+  finishPlan,
   formatDuration,
   nextCaptureVideo,
   playerErrorCode,
@@ -30,11 +32,7 @@ const YOUTUBE_HOST = "https://www.youtube-nocookie.com";
 
 type Phase = "idle" | "running" | "sharing_stopped" | "paused" | "processing" | "failure";
 
-type Outcome =
-  | { kind: "ended" }
-  | { kind: "error"; code: string }
-  | { kind: "stopped" }
-  | { kind: "capture_failed"; message: string };
+type Outcome = CaptureOutcome;
 
 interface Failure {
   step: "start" | "capture" | "finish" | "poll";
@@ -62,6 +60,8 @@ export default function DeepImportCapture({ jobId }: { jobId: string }) {
   const [failure, setFailure] = useState<Failure | null>(null);
   const [pauseRequested, setPauseRequested] = useState(false);
   const [playerElement, setPlayerElement] = useState<HTMLDivElement | null>(null);
+  // Failed frame uploads of each video's latest attempt, shown until it is retried.
+  const [frameFailures, setFrameFailures] = useState<Record<string, number>>({});
 
   const runningRef = useRef(false);
   const pauseRequestedRef = useRef(false);
@@ -82,6 +82,8 @@ export default function DeepImportCapture({ jobId }: { jobId: string }) {
       if (!runningRef.current) setPhase("sharing_stopped");
     },
     onAudioFailure: (error) => settle({ kind: "capture_failed", message: error.message }),
+    onFrameFailureLimit: (count) =>
+      settle({ kind: "capture_failed", message: `${count} frame uploads failed.` }),
   });
   const captureRef = useRef(capture);
   useEffect(() => {
@@ -198,6 +200,11 @@ export default function DeepImportCapture({ jobId }: { jobId: string }) {
   const runVideo = useCallback(
     async (video: ImportVideo) => {
       setCurrent(video);
+      setFrameFailures((previous) => {
+        const next = { ...previous };
+        delete next[video.video_id];
+        return next;
+      });
       let session: CaptureSession;
       try {
         session = await startCapture(jobId, video.video_id);
@@ -210,20 +217,26 @@ export default function DeepImportCapture({ jobId }: { jobId: string }) {
       // Fall back to the listed duration: with player_duration 0 the server would
       // accept an interrupted capture as complete.
       const duration = Number(playerRef.current?.getDuration()) || video.duration_seconds;
-      const stats = await captureRef.current.detach();
+      try {
+        playerRef.current?.pauseVideo();
+      } catch {
+        /* the player may not be ready */
+      }
+      // detach() uploads the recorder's final chunk and every held frame, so its
+      // result (not the outcome alone) decides whether the capture is complete.
+      const result = await captureRef.current.detach();
       destroyPlayer();
-      if (outcome.kind === "capture_failed") {
-        setFailure({ step: "capture", video, message: outcome.message });
+      if (result.failedFrames > 0) {
+        setFrameFailures((previous) => ({ ...previous, [video.video_id]: result.failedFrames }));
+      }
+      const plan = finishPlan(outcome, result, duration);
+      if (plan.kind === "retry") {
+        // No finish: the retry's capture/start resets the server-side sink.
+        setFailure({ step: "capture", video, message: plan.message });
         setPhase("failure");
         return false;
       }
-      const body: FinishBody = {
-        ended: outcome.kind === "ended",
-        ad_seconds: stats.adSeconds,
-        player_duration: duration,
-        ...(outcome.kind === "error" ? { error_code: outcome.code } : {}),
-      };
-      if (!(await sendFinish(video, body))) return false;
+      if (!(await sendFinish(video, plan.body))) return false;
       if (outcome.kind === "stopped") {
         setPhase("sharing_stopped");
         return false;
@@ -481,6 +494,9 @@ export default function DeepImportCapture({ jobId }: { jobId: string }) {
               >
                 {t(`deep_import.stage.${video.stage}`)}
                 {video.error_code ? ` (${video.error_code})` : ""}
+                {frameFailures[video.video_id]
+                  ? ` · ${t("{{count}} frame uploads failed", { count: frameFailures[video.video_id] })}`
+                  : ""}
               </span>
             </li>
           ))}

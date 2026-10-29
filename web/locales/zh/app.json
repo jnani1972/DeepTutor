@@ -5562,5 +5562,6 @@
   "deep_import.stage.described": "已描述",
   "deep_import.stage.done": "已完成",
   "deep_import.stage.skipped": "已跳过",
-  "deep_import.stage.failed": "失败"
+  "deep_import.stage.failed": "失败",
+  "{{count}} frame uploads failed": "{{count}} 个画面上传失败"
 }

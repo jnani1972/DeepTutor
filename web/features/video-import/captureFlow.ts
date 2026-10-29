@@ -1,6 +1,6 @@
 import { activeWorkspaceId, scopedUrl } from "@/lib/workspace-scope";
 
-import type { ImportJob, ImportVideo } from "./api";
+import type { FinishBody, ImportJob, ImportVideo } from "./api";
 
 /** Mirrors `YOUTUBE_PLAYER_ERRORS` in deeptutor/video_import/capture.py. */
 const YOUTUBE_PLAYER_ERRORS: Record<number, string> = {
@@ -41,4 +41,53 @@ export function deepImportRoute(jobId?: string, workspaceId = activeWorkspaceId(
     ? `/learning/deep-import/${encodeURIComponent(jobId)}`
     : "/learning/deep-import";
   return workspaceId ? scopedUrl(path, workspaceId) : path;
+}
+
+/** Failed frame uploads tolerated per video; frames are lossy by design. */
+export const FRAME_FAILURE_LIMIT = 5;
+
+export type CaptureOutcome =
+  | { kind: "ended" }
+  | { kind: "error"; code: string }
+  | { kind: "stopped" }
+  | { kind: "capture_failed"; message: string };
+
+export interface CaptureResult {
+  adSeconds: number;
+  audioFailed: boolean;
+  failedFrames: number;
+}
+
+export type FinishPlan =
+  | { kind: "finish"; body: FinishBody }
+  | { kind: "retry"; message: string };
+
+/**
+ * Decide what to tell the server once a video's capture stopped.
+ *
+ * A capture that lost audio (including the recorder's final flush) or hit the
+ * frame-failure limit is never finished: the owner retries the video, and
+ * `capture/start` resets the server-side sink. Sharing stopped → `ended:false`
+ * so the server re-queues an incomplete capture.
+ */
+export function finishPlan(
+  outcome: CaptureOutcome,
+  result: CaptureResult,
+  playerDuration: number,
+): FinishPlan {
+  const base = { ad_seconds: result.adSeconds, player_duration: playerDuration };
+  if (outcome.kind === "error") {
+    return { kind: "finish", body: { ended: false, ...base, error_code: outcome.code } };
+  }
+  if (outcome.kind === "capture_failed") return { kind: "retry", message: outcome.message };
+  if (result.audioFailed) {
+    return { kind: "retry", message: "An audio chunk could not be uploaded." };
+  }
+  if (result.failedFrames >= FRAME_FAILURE_LIMIT) {
+    return {
+      kind: "retry",
+      message: `${result.failedFrames} frame uploads failed.`,
+    };
+  }
+  return { kind: "finish", body: { ended: outcome.kind === "ended", ...base } };
 }
