@@ -79,3 +79,56 @@ lms load text-embedding-nomic-embed-text-v1.5 -y
 ```
 
 Frames with no instructional content (talking head, blank screen) produce no note. A failed description batch is logged and skipped; the video import continues.
+
+## Using video import
+
+### API
+
+All routes live under `/api/v1/video-import` and use the same sign-in as the rest of the app. Responses are job progress only; notes are never returned.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /preview` `{url?, folder?}` | `{kind, title, entries, total_seconds}`. 400 for a bad request, 422 `{code}` when the listing fails |
+| `POST /jobs` `{url?, folder?, video_ids?, kb_name?}` | Create a job |
+| `GET /jobs`, `GET /jobs/{id}` | List / read jobs (404 for an unknown id) |
+| `POST /jobs/{id}/pause`, `/resume`, `/cancel` | Control a job |
+| `POST /jobs/{id}/videos/{vid}/capture/start` | Begin browser capture; returns `{sample_seconds, audio_timeslice_ms}` |
+| `POST /jobs/{id}/videos/{vid}/capture/audio` | Raw `audio/webm` chunk (max 5 MiB, 413 above; 409 if no capture is in progress) |
+| `POST /jobs/{id}/videos/{vid}/capture/frame?t=<seconds>` | Raw `image/jpeg` (max 2 MiB, 413 above; 409 as above) |
+| `POST /jobs/{id}/videos/{vid}/capture/finish` `{ended, ad_seconds, player_duration, error_code?}` | End the capture and hand the video to processing |
+
+Pause and cancel on a job that is currently running only set a flag that the worker honours at its next checkpoint. The response can therefore still show the old status; poll `GET /jobs/{id}` for the settled state.
+
+### CLI
+
+JSON output, like `deeptutor config`:
+
+```
+deeptutor video-import preview (URL | --folder PATH)
+deeptutor video-import start (URL | --folder PATH) [--kb NAME] [--only ID ...]
+deeptutor video-import status [JOB_ID]
+deeptutor video-import pause|resume|cancel JOB_ID
+```
+
+Browser capture itself is web-only. The CLI runs folder jobs end to end and waits for them to finish.
+
+## Running the fork image (switching from the GHCR stack)
+
+`compose.yaml` runs the upstream image `ghcr.io/hkuds/deeptutor:latest`, which does not contain video import. `docker-compose.yml` builds the fork (`deeptutor-deeptutor:latest`), joins network `deeptutor-network`, and includes the `speaches` service. No script change is needed: `scripts/docker_compose.py` passes its arguments to `docker compose`, so naming the file selects the stack.
+
+```
+# 1. Build the fork image (does not touch running containers)
+python scripts/docker_compose.py -f docker-compose.yml build deeptutor
+
+# 2. Stop and remove the GHCR stack (compose.yaml is the default file)
+python scripts/docker_compose.py down
+
+# 3. Start the fork stack, including speaches
+python scripts/docker_compose.py -f docker-compose.yml up -d
+```
+
+- `./data` is a bind mount in both files, so settings, knowledge bases and accounts persist.
+- The fork stack publishes the same ports (from `system.json`). Always pass `-f docker-compose.yml` from now on, for example `python scripts/docker_compose.py -f docker-compose.yml logs -f deeptutor`.
+- speaches is now on `deeptutor-network` with the app, so the manual link is no longer needed. If you had run `docker network connect --alias speaches <network> speaches`, remove it: `docker network disconnect <old_network> speaches`.
+- Both files use compose project `deeptutor`, so the existing `speaches` container and its model-cache volume are kept; `up -d` reuses it.
+- Verify: `docker exec deeptutor curl -sf http://speaches:8000/v1/models`

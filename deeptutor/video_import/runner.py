@@ -382,6 +382,12 @@ class ImportRunner:
             self._enqueue(store, job.job_id)
         return job
 
+    def list_jobs(self) -> list[ImportJob]:
+        return self._resolve_store().list()
+
+    def get_job(self, job_id: str) -> ImportJob:
+        return self._resolve_store().load(job_id)
+
     # ── browser capture sessions ──────────────────────────────────────────
 
     def begin_capture(self, job_id: str, video_id: str) -> CaptureSink:

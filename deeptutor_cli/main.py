@@ -24,6 +24,7 @@ from .plugin import register as register_plugin
 from .provider_cmd import register as register_provider
 from .session_cmd import register as register_session
 from .skill import register as register_skill
+from .video_import import register as register_video_import
 from .workspace_cmd import register as register_workspace
 
 set_mode(RunMode.CLI)
@@ -48,6 +49,7 @@ notebook_app = typer.Typer(help="Manage notebooks and imported markdown records.
 provider_app = typer.Typer(help="Manage provider OAuth login.")
 book_app = typer.Typer(help="Manage interactive Books (BookEngine).")
 workspace_app = typer.Typer(help="Manage the user content workspace.")
+video_import_app = typer.Typer(help="Import videos and media folders into notes and a knowledge base.")
 
 app.add_typer(partner_app, name="partner")
 app.add_typer(chat_app, name="chat")
@@ -57,6 +59,7 @@ app.add_typer(skill_app, name="skills")  # alias: `deeptutor skills …`
 app.add_typer(memory_app, name="memory")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(config_app, name="config")
+app.add_typer(video_import_app, name="video-import")
 app.add_typer(session_app, name="session")
 app.add_typer(notebook_app, name="notebook")
 app.add_typer(provider_app, name="provider")
@@ -75,6 +78,7 @@ register_notebook(notebook_app)
 register_provider(provider_app)
 register_book(book_app)
 register_workspace(workspace_app)
+register_video_import(video_import_app)
 register_doctor(app)
 register_init(app)
 

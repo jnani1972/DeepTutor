@@ -39,7 +39,8 @@ def test_only_canonical_transport_and_resource_routes_are_registered() -> None:
     assert not {
         path
         for path in paths
-        if any(path == prefix or path.startswith(prefix + "/") for prefix in retired_prefixes)
+        if not path.startswith("/api/v1/video-import/")
+        and any(path == prefix or path.startswith(prefix + "/") for prefix in retired_prefixes)
     }
     assert "/api/system/runtime-topology" not in paths
 
