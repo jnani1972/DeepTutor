@@ -188,4 +188,24 @@ describe("VideoCaptureSession", () => {
     expect(h.deps.uploadFrame).toHaveBeenCalledTimes(1);
     expect(vi.mocked(h.deps.uploadFrame).mock.calls[0][0]).toBeCloseTo(0.5);
   });
+
+  it("pauses the recorder whenever the player is not playing", () => {
+    const h = harness();
+    openGate(h);
+    const recorder = h.recorders[0];
+    expect(recorder.state).toBe("recording");
+
+    for (const state of [2 /* paused */, 3 /* buffering */]) {
+      h.setState(state);
+      h.advance(500, 0);
+      h.session.tickAd();
+      expect(recorder.state).toBe("paused");
+      expect(h.session.inAd).toBe(false);
+
+      h.setState(PLAYING);
+      h.advance(500, 0.5);
+      h.session.tickAd();
+      expect(recorder.state).toBe("recording");
+    }
+  });
 });

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from deeptutor.video_import.capture import CapturedFrame
-from deeptutor.video_import.describe import describe_frames
+from deeptutor.video_import.describe import VisionUnavailableError, describe_frames
 from deeptutor.video_import.notes import FrameNote
 
 
@@ -28,8 +28,8 @@ def frame(tmp_path: Path, t: float) -> CapturedFrame:
 
 @pytest.mark.asyncio
 async def test_none_answers_and_failures_are_dropped(tmp_path):
-    frames = [frame(tmp_path, t) for t in (0.0, 5.0, 10.0)]
-    batcher = FakeBatcher([["  Slide: Enzymes ", "NONE", None]])
+    frames = [frame(tmp_path, t) for t in (0.0, 5.0, 10.0, 15.0)]
+    batcher = FakeBatcher([["  Slide: Enzymes ", "None.", None, "NONE"]])
     notes = await describe_frames(frames, batcher=batcher)
     assert notes == [FrameNote(0.0, "Slide: Enzymes")]
     assert batcher.calls[0][0]["mimetype"] == "image/jpeg"
@@ -42,3 +42,11 @@ async def test_batch_exception_drops_that_batch_only(tmp_path):
     batcher = FakeBatcher([RuntimeError("boom"), ["A", "B"]])
     notes = await describe_frames(frames, batcher=batcher)
     assert notes == [FrameNote(4.0, "A"), FrameNote(5.0, "B")]
+
+
+@pytest.mark.asyncio
+async def test_every_batch_failing_means_vision_is_unavailable(tmp_path):
+    frames = [frame(tmp_path, t) for t in range(6)]
+    batcher = FakeBatcher([ConnectionError("refused"), RuntimeError("later")])
+    with pytest.raises(VisionUnavailableError, match="refused"):
+        await describe_frames(frames, batcher=batcher)

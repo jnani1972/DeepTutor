@@ -22,6 +22,10 @@ FRAME_PROMPT = (
 FRAME_SYSTEM_PROMPT = "You turn lecture video frames into accurate study notes."
 
 
+class VisionUnavailableError(RuntimeError):
+    """Every frame batch failed: the vision model is not reachable at all."""
+
+
 def _image(frame: CapturedFrame) -> dict[str, str]:
     return {
         "base64": base64.b64encode(frame.path.read_bytes()).decode("ascii"),
@@ -45,15 +49,21 @@ async def describe_frames(
             system_prompt=FRAME_SYSTEM_PROMPT,
         )
     notes: list[FrameNote] = []
+    first_error: Exception | None = None
+    succeeded = False
     for start in range(0, len(frames), batch_size):
         batch = frames[start : start + batch_size]
         try:
             answers = await batcher.describe([_image(f) for f in batch])
-        except Exception:
+        except Exception as exc:
             logger.warning("Frame description batch at %.1fs failed", batch[0].t_seconds, exc_info=True)
+            first_error = first_error or exc
             continue
+        succeeded = True
         for frame, answer in zip(batch, answers):
             text = (answer or "").strip()
-            if text and text != "NONE":
+            if text and text.strip(" .").upper() != "NONE":
                 notes.append(FrameNote(frame.t_seconds, text))
+    if not succeeded and first_error is not None:
+        raise VisionUnavailableError(str(first_error) or type(first_error).__name__)
     return notes

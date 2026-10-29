@@ -5545,6 +5545,7 @@
   "No videos found.": "未找到视频。",
   "{{count}} selected · total {{duration}}": "已选 {{count}} 个 · 总时长 {{duration}}",
   "Capture runs in real time: the videos play once in this tab.": "捕获按实际时长进行：视频会在此标签页中完整播放一次。",
+  "Leave blank for an automatic name": "留空则自动命名",
   "Start import": "开始导入",
   "Recent imports": "最近的导入",
   "deep_import.status.pending": "等待中",

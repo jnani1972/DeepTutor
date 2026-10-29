@@ -144,9 +144,7 @@ class FileCapture:
             "ffmpeg", "-y", "-v", "error", "-i", str(source),
             "-vn", "-ac", "1", "-c:a", "libopus", str(target),
         )  # fmt: skip
-        with target.open("rb") as handle:
-            while chunk := handle.read(_AUDIO_CHUNK_BYTES):
-                sink.append_audio(chunk)
+        await asyncio.to_thread(_append_audio_file, target, sink)
 
     @staticmethod
     async def _extract_frames(source: Path, tmp: Path, sink: CaptureSink) -> None:
@@ -154,9 +152,20 @@ class FileCapture:
             "ffmpeg", "-y", "-v", "error", "-i", str(source),
             "-an", "-vf", "fps=1", "-q:v", "3", str(tmp / "%06d.jpg"),
         )  # fmt: skip
-        for frame in sorted(tmp.glob("*.jpg")):
-            sink.offer_frame(int(frame.stem) - 1, frame.read_bytes())
-            frame.unlink()
+        # PIL decoding and file writes: about a minute per hour of video, off the loop.
+        await asyncio.to_thread(_offer_frames, tmp, sink)
+
+
+def _append_audio_file(target: Path, sink: CaptureSink) -> None:
+    with target.open("rb") as handle:
+        while chunk := handle.read(_AUDIO_CHUNK_BYTES):
+            sink.append_audio(chunk)
+
+
+def _offer_frames(tmp: Path, sink: CaptureSink) -> None:
+    for frame in sorted(tmp.glob("*.jpg")):
+        sink.offer_frame(int(frame.stem) - 1, frame.read_bytes())
+        frame.unlink()
 
 
 def _chapters(rows: list[dict]) -> list[Chapter]:

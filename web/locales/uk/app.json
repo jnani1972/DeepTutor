@@ -5540,6 +5540,7 @@
   "Ad playing — recording is paused until the video resumes.": "Триває реклама — запис призупинено, доки відео не продовжиться.",
   "Capture of \"{{title}}\" failed: {{message}}": "Не вдалося захопити «{{title}}»: {{message}}",
   "Capture runs in real time: the videos play once in this tab.": "Захоплення відбувається в реальному часі: відео один раз відтворюються в цій вкладці.",
+  "Leave blank for an automatic name": "Залиште порожнім для автоматичної назви",
   "Deep import": "Глибокий імпорт",
   "Folder path inside the workspace": "Шлях до теки в робочому просторі",
   "Import paused.": "Імпорт призупинено.",

@@ -67,7 +67,12 @@ lms get qwen/qwen3-vl-8b -y
 
 Add `qwen/qwen3-vl-8b` to the LM Studio profile's models in `model_catalog.json`, then set `image_description_model` in `document_parsing.json` to that profile and model id.
 
-An 8 GB GPU cannot hold the chat model and the vision model together. Load the vision model only while frames are described, then restore the chat model:
+An 8 GB GPU cannot hold the chat model and the vision model together, so the import switches models itself over LM Studio's REST API:
+
+- Before describing frames it unloads the STT model and every LM Studio model except the configured image description model, then loads that model (only if LM Studio lists it; a cloud vision model is left alone).
+- Before indexing, and whenever a job stops, it unloads everything except the chat and embedding models and loads those two again (`qwen/qwen3-30b-a3b-2507` with 16384 context, `text-embedding-nomic-embed-text-v1.5`). The REST API cannot set a GPU offload ratio, so LM Studio uses the model's saved default; set `--gpu 0.35` as that default if you need it.
+
+The manual equivalent:
 
 ```
 lms unload --all
@@ -78,7 +83,7 @@ lms load qwen/qwen3-30b-a3b-2507 -c 16384 --gpu 0.35 -y
 lms load text-embedding-nomic-embed-text-v1.5 -y
 ```
 
-Frames with no instructional content (talking head, blank screen) produce no note. A failed description batch is logged and skipped; the video import continues.
+Frames with no instructional content (talking head, blank screen) produce no note. A single failed description batch is logged and skipped, and the video continues. If **every** batch of a video fails (the vision model is unreachable), the job stops as `failed` with error code `vision_unavailable`; the frames are kept and the video stays transcribed, so **Resume** describes it again once the model is back.
 
 ## Using video import
 
@@ -89,7 +94,7 @@ All routes live under `/api/video-import` and use the same sign-in as the rest o
 | Route | Purpose |
 | --- | --- |
 | `POST /preview` `{url?, folder?}` | `{kind, title, entries, total_seconds}`. 400 for a bad request, 422 `{code}` when the listing fails |
-| `POST /jobs` `{url?, folder?, video_ids?, kb_name?}` | Create a job |
+| `POST /jobs` `{url?, folder?, video_ids?, kb_name?}` | Create a job. 400 when `kb_name` is not a valid knowledge base name (it contains a reserved character such as `/`, `\`, `:`, `?`, `#` or `%`); leave it out for an automatic `yt-<title>` / `files-<folder>` name, or the knowledge base of an earlier import of the same playlist |
 | `GET /jobs`, `GET /jobs/{id}` | List / read jobs (404 for an unknown id) |
 | `POST /jobs/{id}/pause`, `/resume`, `/cancel` | Control a job |
 | `POST /jobs/{id}/videos/{vid}/capture/start` | Begin browser capture; returns `{sample_seconds, audio_timeslice_ms}` |
@@ -112,6 +117,13 @@ deeptutor video-import pause|resume|cancel JOB_ID
 
 Browser capture itself is web-only. The CLI runs folder jobs end to end and waits for them to finish.
 
+Only one process runs imports at a time, because they share job files and the GPU. The owner holds an OS file lock, `worker.lock` under `data/system/video_import/` (its pid is in `worker.lock.pid`), released automatically when the process exits.
+
+- **Server running.** The server owns imports for as long as it runs. `start`, `pause`, `resume` and `cancel` in the CLI refuse with `worker_busy` and the server's pid; use the web app or the API instead. `preview` and `status` still work.
+- **No server running.** The CLI takes ownership. `start --folder` and `resume` process the job until it finishes, pauses or fails, then exit.
+- **Server started while a CLI run is processing.** The server waits for the CLI to exit before resuming interrupted jobs; until then the web app answers job changes with 409 `worker_busy`.
+- Run the CLI where the server runs (for the Docker stack: `docker exec deeptutor deeptutor video-import ...`). A lock cannot be shared between the host and a container.
+
 ### Web: browser capture
 
 Open `/learning/deep-import`, paste a YouTube URL (or a workspace folder path), pick videos, then start. On the capture page:
@@ -124,6 +136,9 @@ The videos play one at a time and stay audible to you.
 
 - **Upload failures.** A failed audio or frame upload is retried twice. If a video still loses an audio chunk, or 5 or more frame uploads fail, the page shows the error with **Retry this video**. Nothing is sent as complete, and the retry captures the video again from the start.
 - **Sharing stopped.** If you stop sharing, the current video is re-queued and captured again when you share once more.
+- **Pausing and buffering.** Audio recording pauses whenever the player is paused or buffering and resumes with playback, so the transcript stays aligned with the frames.
+- **Do not seek.** Speech timestamps come from the recorded audio, frame timestamps from the player clock. Skipping forward or back during capture misaligns the two (and skipped parts are simply missing from the notes).
+- **Video start.** About 0.5 to 0.75 s at the very start of each video is not recorded: capture starts only after the video's own clock has visibly advanced (the pre-roll ad gate below).
 
 ### Ads during capture
 

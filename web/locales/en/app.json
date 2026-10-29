@@ -5545,6 +5545,7 @@
   "No videos found.": "No videos found.",
   "{{count}} selected · total {{duration}}": "{{count}} selected · total {{duration}}",
   "Capture runs in real time: the videos play once in this tab.": "Capture runs in real time: the videos play once in this tab.",
+  "Leave blank for an automatic name": "Leave blank for an automatic name",
   "Start import": "Start import",
   "Recent imports": "Recent imports",
   "deep_import.status.pending": "Pending",

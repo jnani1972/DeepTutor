@@ -62,7 +62,6 @@ export default function DeepImportStart() {
       setPreview(result);
       setPreviewSource(source);
       setSelected(new Set(result.entries.map((entry) => entry.video_id)));
-      if (!kbName.trim()) setKbName(result.title);
     } catch (caught) {
       setError(messageOf(caught));
     } finally {
@@ -201,6 +200,7 @@ export default function DeepImportStart() {
             <input
               className={inputClass}
               value={kbName}
+              placeholder={t("Leave blank for an automatic name")}
               onChange={(event) => setKbName(event.target.value)}
             />
           </label>

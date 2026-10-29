@@ -102,7 +102,10 @@ async def create_job(body: CreateBody, runner: Any = Depends(get_runner)) -> dic
             url=body.url, folder=body.folder, video_ids=body.video_ids, kb_name=body.kb_name
         )
     except ValueError as exc:
-        raise HTTPException(400, detail=str(exc)) from exc
+        # Invalid input (e.g. a reserved character in kb_name) is 400; a CLI
+        # process owning video imports (``worker_busy``) is a 409 conflict.
+        status = 409 if getattr(exc, "code", "") == "worker_busy" else 400
+        raise HTTPException(status, detail=str(exc)) from exc
     except Exception as exc:
         failure = _listing_failure(exc)
         if failure is None:

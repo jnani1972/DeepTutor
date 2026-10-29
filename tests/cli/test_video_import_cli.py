@@ -75,3 +75,34 @@ def test_status_and_pause(monkeypatch):
     assert runner.invoke(app, ["video-import", "status", "nope"]).exit_code == 1
     paused = runner.invoke(app, ["video-import", "pause", "j1"])
     assert json.loads(paused.stdout)["job_id"] == "j1"
+
+
+def test_resume_processes_until_the_job_stops(monkeypatch):
+    fake = _patch(monkeypatch)
+
+    async def resume(job_id):
+        fake.calls.append(("resume", job_id))
+        return FakeJob(job_id)
+
+    fake.resume = resume
+    result = runner.invoke(app, ["video-import", "resume", "j1"])
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [("resume", "j1"), ("drain",)]
+
+
+def test_control_and_start_refuse_while_another_process_owns_imports(monkeypatch, tmp_path):
+    from deeptutor.video_import.ownership import WorkerBusyError
+
+    fake = _patch(monkeypatch)
+
+    async def busy(*_args, **_kwargs):
+        raise WorkerBusyError("Another DeepTutor process (pid 7) owns video imports.")
+
+    fake.pause = fake.create = busy
+    paused = runner.invoke(app, ["video-import", "pause", "j1"])
+    assert paused.exit_code == 1
+    assert "pid 7" in paused.stderr
+    started = runner.invoke(app, ["video-import", "start", "--folder", str(tmp_path)])
+    assert started.exit_code == 1
+    assert "worker_busy" in started.stderr
+    assert ("drain",) not in fake.calls

@@ -156,6 +156,18 @@ def test_create_value_error_is_400(client, runner):
     assert client.post(f"{BASE}/jobs", json={"folder": "/x"}).status_code == 400
 
 
+def test_create_while_another_process_owns_imports_is_409(client, runner):
+    from deeptutor.video_import.ownership import WorkerBusyError
+
+    async def busy(**kwargs):
+        raise WorkerBusyError("Another DeepTutor process (pid 7) owns video imports.")
+
+    runner.create = busy
+    response = client.post(f"{BASE}/jobs", json={"folder": "/x"})
+    assert response.status_code == 409
+    assert "pid 7" in response.json()["detail"]
+
+
 def test_capture_start(client):
     body = client.post(f"{BASE}/jobs/j1/videos/a/capture/start").json()
     assert body == {"sample_seconds": 1, "audio_timeslice_ms": 5000}

@@ -23,6 +23,7 @@ import shutil
 import threading
 import uuid
 
+from deeptutor.knowledge.naming import validate_knowledge_base_name
 from deeptutor.multi_user.context import (
     get_current_user_or_none,
     reset_current_user,
@@ -33,8 +34,9 @@ from deeptutor.multi_user.paths import SYSTEM_ROOT, get_current_path_service
 from deeptutor.reading.ingestion import TranscriptSegment, _probe_stt_configuration
 from deeptutor.services.file_io import atomic_write_json
 
+from . import ownership
 from .capture import CapturedFrame, CaptureResult, CaptureSink
-from .describe import describe_frames
+from .describe import VisionUnavailableError, describe_frames
 from .files import FileCapture, list_media_folder, media_path
 from .gpu import ModelSwitcher
 from .kb import add_notes_to_kb
@@ -177,12 +179,21 @@ def _save_segments(video_dir: Path, segments: list[TranscriptSegment]) -> None:
     (video_dir / "audio.webm").unlink(missing_ok=True)
 
 
+def _saved_segments(video_dir: Path) -> list[TranscriptSegment] | None:
+    try:
+        rows = json.loads((video_dir / "segments.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    return [TranscriptSegment(start, end, text) for start, end, text in rows]
+
+
 def _load_described_inputs(
     video_dir: Path,
 ) -> tuple[dict, list[TranscriptSegment], list[CapturedFrame]]:
     meta = json.loads((video_dir / "meta.json").read_text(encoding="utf-8"))
-    rows = json.loads((video_dir / "segments.json").read_text(encoding="utf-8"))
-    segments = [TranscriptSegment(start, end, text) for start, end, text in rows]
+    segments = _saved_segments(video_dir)
+    if segments is None:
+        raise FileNotFoundError(video_dir / "segments.json")
     frames = [
         CapturedFrame(float(f["t"]), video_dir / "frames" / f["file"]) for f in meta["frames"]
     ]
@@ -279,15 +290,22 @@ class ImportRunner:
         lister=list_target,
         folder_lister=list_media_folder,
         index_path: Path | None = None,
+        lock_path: Path | None = None,
+        claim_poll_seconds: float = 5.0,
     ) -> None:
         if isinstance(store, ImportJobStore):
             fixed = store
             self._resolve_store: StoreResolver = lambda: fixed
             index_path = index_path or fixed.root / "active_jobs.json"
+            lock_path = lock_path or fixed.root / "worker.lock"
         else:
             self._resolve_store = store
             index_path = index_path or SYSTEM_ROOT / "video_import" / "active_jobs.json"
+            lock_path = lock_path or SYSTEM_ROOT / "video_import" / "worker.lock"
         self._index = _ActiveIndex(index_path)
+        self._lock_path = lock_path
+        self._claim_poll_seconds = claim_poll_seconds
+        self._claim_task: asyncio.Task[None] | None = None
         self._file_capture = file_capture
         self._details = details
         self._transcribe = transcribe
@@ -303,6 +321,18 @@ class ImportRunner:
         self._running: str | None = None
         self._pause_requested: set[str] = set()
         self._cancel_requested: set[str] = set()
+
+    # ── process ownership ─────────────────────────────────────────────────
+
+    def _own(self) -> None:
+        """Every job change needs this process to own processing (see ownership)."""
+        if not ownership.claim(self._lock_path):
+            raise ownership.busy_error(self._lock_path)
+
+    async def _recover_when_free(self) -> None:
+        while not await asyncio.to_thread(ownership.claim, self._lock_path):
+            await asyncio.sleep(self._claim_poll_seconds)
+        await self.recover()
 
     # ── creation ──────────────────────────────────────────────────────────
 
@@ -326,6 +356,7 @@ class ImportRunner:
         video_ids: list[str] | None = None,
         kb_name: str | None = None,
     ) -> ImportJob:
+        self._own()
         store = self._resolve_store()
         target, listing = await self.preview(url=url, folder=folder)
         entries = listing.entries
@@ -347,6 +378,8 @@ class ImportRunner:
                 kb_name = f"files-{_slug(Path(target.folder).name)}"
             else:
                 kb_name = f"yt-{_slug(listing.title)}"
+        # Fail now, not at indexing time hours later (ValueError -> HTTP 400).
+        kb_name = validate_knowledge_base_name(kb_name)
         done = (
             await asyncio.to_thread(store.done_video_ids, target.playlist_id)
             if target.playlist_id
@@ -391,6 +424,7 @@ class ImportRunner:
     # ── browser capture sessions ──────────────────────────────────────────
 
     def begin_capture(self, job_id: str, video_id: str) -> CaptureSink:
+        self._own()
         store = self._resolve_store()
         job = store.load(job_id)
         if job.status not in (JobStatus.waiting_for_playback, JobStatus.capturing):
@@ -428,11 +462,12 @@ class ImportRunner:
         sink = self._sinks[key]
         job = await asyncio.to_thread(store.load, job_id)
         video = self._video(job, video_id)
-        incomplete = (
-            not ended
-            and player_duration > 0
-            and sink.max_offered_t < MIN_COVERAGE * player_duration
+        duration = player_duration if player_duration > 0 else float(video.duration_seconds)
+        # Without any known duration a capture that did not end cannot be proven whole.
+        incomplete = not ended and (
+            duration <= 0 or sink.max_offered_t < MIN_COVERAGE * duration
         )
+        captured = sink.max_offered_t  # reset() zeroes it
         if error_code or incomplete:
             await asyncio.to_thread(sink.reset)
             if error_code:
@@ -442,7 +477,7 @@ class ImportRunner:
                 video.stage = VideoStage.queued
                 video.error_code = "incomplete_capture"
                 video.error_detail = (
-                    f"Captured {sink.max_offered_t:.0f}s of {player_duration:.0f}s"
+                    f"Captured {captured:.0f}s of {duration:.0f}s"
                 )
         else:
             chapters, description = await self._details(video_id)
@@ -464,6 +499,7 @@ class ImportRunner:
     # ── control ───────────────────────────────────────────────────────────
 
     def start(self, job_id: str) -> None:
+        self._own()
         store = self._resolve_store()
         store.load(job_id)  # KeyError for a job outside the caller's scope
         self._enqueue(store, job_id)
@@ -482,6 +518,7 @@ class ImportRunner:
 
     async def pause(self, job_id: str) -> ImportJob:
         """Pause a job; a running job stops at its next video or phase boundary."""
+        self._own()
         store = self._resolve_store()
         job = await asyncio.to_thread(store.load, job_id)
         if job.status not in _PAUSABLE:
@@ -495,6 +532,7 @@ class ImportRunner:
         return job
 
     async def resume(self, job_id: str) -> ImportJob:
+        self._own()
         store = self._resolve_store()
         job = await asyncio.to_thread(store.load, job_id)
         if job_id == self._running and job_id in self._pause_requested:
@@ -513,6 +551,7 @@ class ImportRunner:
         return job
 
     async def cancel(self, job_id: str) -> ImportJob:
+        self._own()
         store = self._resolve_store()
         job = await asyncio.to_thread(store.load, job_id)
         if job.status in (JobStatus.done, JobStatus.cancelled):
@@ -529,7 +568,16 @@ class ImportRunner:
         """Requeue work interrupted by a restart, across every user's scope.
 
         Capture sessions start over: in-memory sinks do not survive a restart.
+        While another process (a CLI run) owns processing, recovery waits in the
+        background until that process exits.
         """
+        if not await asyncio.to_thread(ownership.claim, self._lock_path):
+            logger.warning("Video imports are owned by another process; recovery deferred")
+            if self._claim_task is None or self._claim_task.done():
+                self._claim_task = asyncio.get_running_loop().create_task(
+                    self._recover_when_free()
+                )
+            return
         for job_id, root in (await asyncio.to_thread(self._index.entries)).items():
             store = await asyncio.to_thread(ImportJobStore, Path(root))
             try:
@@ -612,7 +660,16 @@ class ImportRunner:
                 for video in self._at(job, VideoStage.transcribed):
                     if await self._halted(store, job):
                         return
-                    await self._describe_video(store, job, video)
+                    try:
+                        await self._describe_video(store, job, video)
+                    except VisionUnavailableError as exc:
+                        # Frames are kept and the video stays transcribed, so
+                        # Resume describes it again once the model is reachable.
+                        job.status = JobStatus.failed
+                        job.error_code = "vision_unavailable"
+                        job.error_detail = str(exc)
+                        await self._save(store, job)
+                        return
             if await self._halted(store, job):
                 return
 
@@ -688,14 +745,23 @@ class ImportRunner:
     ) -> None:
         video_dir = await asyncio.to_thread(store.video_dir, job.job_id, video.video_id)
         audio = video_dir / "audio.webm"
+        saved = None
         try:
             has_audio = await asyncio.to_thread(lambda: audio.exists() and audio.stat().st_size > 0)
-            segments = list(await self._transcribe(audio)) if has_audio else []
+            if not has_audio:
+                # A crash after segments.json was written (and the audio deleted)
+                # but before the stage change: reuse it instead of blanking it.
+                saved = await asyncio.to_thread(_saved_segments, video_dir)
+            if saved is not None:
+                segments = saved
+            else:
+                segments = list(await self._transcribe(audio)) if has_audio else []
         except Exception as exc:
             logger.warning("Transcribing %s failed", video.video_id, exc_info=True)
             self._fail(video, "transcribe_failed", str(exc))
         else:
-            await asyncio.to_thread(_save_segments, video_dir, segments)
+            if saved is None:
+                await asyncio.to_thread(_save_segments, video_dir, segments)
             video.stage = VideoStage.transcribed
             video.speech_cues = len(segments)
         await self._save(store, job)
@@ -718,6 +784,8 @@ class ImportRunner:
             )
             path = store.notes_path(job.job_id, entry)
             await asyncio.to_thread(_write_notes, path, markdown, video_dir)
+        except VisionUnavailableError:
+            raise
         except Exception as exc:
             logger.warning("Describing %s failed", video.video_id, exc_info=True)
             self._fail(video, "describe_failed", str(exc))

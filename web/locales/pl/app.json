@@ -5540,6 +5540,7 @@
   "Ad playing — recording is paused until the video resumes.": "Trwa reklama — nagrywanie jest wstrzymane do wznowienia filmu.",
   "Capture of \"{{title}}\" failed: {{message}}": "Przechwytywanie „{{title}}” nie powiodło się: {{message}}",
   "Capture runs in real time: the videos play once in this tab.": "Przechwytywanie trwa w czasie rzeczywistym: filmy zostaną raz odtworzone w tej karcie.",
+  "Leave blank for an automatic name": "Pozostaw puste, aby użyć nazwy automatycznej",
   "Deep import": "Głęboki import",
   "Folder path inside the workspace": "Ścieżka folderu w obszarze roboczym",
   "Import paused.": "Import wstrzymany.",

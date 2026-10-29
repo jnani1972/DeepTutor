@@ -2,6 +2,12 @@
 
 Browser capture of YouTube videos is web-only; this CLI starts folder jobs end
 to end and controls/inspects any job.
+
+Only one process may process imports or change jobs (see
+``deeptutor.video_import.ownership``). While the DeepTutor server runs, it owns
+them: ``start``/``pause``/``resume``/``cancel`` here refuse with a clear
+message (``preview``/``status`` still work). With no server running, the CLI
+takes ownership and ``start --folder`` and ``resume`` process to completion.
 """
 
 from __future__ import annotations
@@ -107,8 +113,17 @@ def register(app: typer.Typer) -> None:
             _fail(f"Unknown import job: {job_id}")
 
     def _control(action: str, job_id: str) -> None:
+        async def go() -> Any:
+            runner = _get_runner()
+            job = await getattr(runner, action)(job_id)
+            if action == "resume":
+                # This process owns the work now: finish it before exiting.
+                await runner.drain()
+                job = runner.get_job(job_id)
+            return job
+
         try:
-            job = asyncio.run(getattr(_get_runner(), action)(job_id))
+            job = asyncio.run(go())
         except KeyError:
             _fail(f"Unknown import job: {job_id}")
         except ValueError as exc:
@@ -122,7 +137,7 @@ def register(app: typer.Typer) -> None:
 
     @app.command("resume")
     def resume(job_id: str = typer.Argument(...)) -> None:
-        """Resume a paused job."""
+        """Resume a paused or failed job and process it until it stops."""
         _control("resume", job_id)
 
     @app.command("cancel")

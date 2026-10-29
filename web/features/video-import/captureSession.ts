@@ -57,6 +57,9 @@ export interface CaptureSessionDeps {
  * - While `AdDetector` says "ad" the recorder is paused and no frames are
  *   grabbed; frames already grabbed inside the ad's stall window are dropped
  *   from the 2.5 s `FrameLookback` buffer before they are uploaded.
+ * - The recorder also pauses whenever the player is not PLAYING (owner pause,
+ *   buffering), so audio-file time keeps tracking player time; speech
+ *   timestamps are audio-file time while frame timestamps are player time.
  * - `detach()` stops the recorder, uploads its final chunk and every buffered
  *   frame, and waits for all uploads, so its result is final.
  */
@@ -148,8 +151,9 @@ export class VideoCaptureSession {
     }
     const recorder = this.recorder;
     if (!recorder) return;
-    if (ad && recorder.state === "recording") recorder.pause();
-    else if (!ad && recorder.state === "paused") recorder.resume();
+    const record = !ad && sample.state === PLAYING;
+    if (!record && recorder.state === "recording") recorder.pause();
+    else if (record && recorder.state === "paused") recorder.resume();
   }
 
   /** Frame tick (every sample period): release held frames, grab a new one. */

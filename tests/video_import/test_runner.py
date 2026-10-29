@@ -1,4 +1,8 @@
+import asyncio
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -9,8 +13,10 @@ from deeptutor.multi_user.context import (
 )
 from deeptutor.multi_user.models import CurrentUser, UserScope
 from deeptutor.reading.ingestion import TranscriptSegment
+from deeptutor.video_import import ownership
 from deeptutor.video_import import runner as runner_module
 from deeptutor.video_import.capture import CaptureSink
+from deeptutor.video_import.describe import VisionUnavailableError
 from deeptutor.video_import.files import file_video_id
 from deeptutor.video_import.listing import Listing
 from deeptutor.video_import.models import (
@@ -55,7 +61,9 @@ class FakeFileCapture:
 
 
 class Harness:
-    def __init__(self, tmp_path: Path, jpeg_of, *, store=None, index_path=None) -> None:
+    def __init__(
+        self, tmp_path: Path, jpeg_of, *, store=None, index_path=None, claim_poll_seconds=5.0
+    ) -> None:
         self.calls: list = []
         self.kb_users: list = []
         self.listing = Listing(
@@ -76,8 +84,10 @@ class Harness:
             switcher=FakeSwitcher(self.calls),
             lister=self.lister,
             folder_lister=self.folder_lister,
+            claim_poll_seconds=claim_poll_seconds,
         )
         self.on_transcribe = None
+        self.vision_down = False
 
     async def details(self, video_id):
         return [Chapter(0.0, "Intro")], f"about {video_id}"
@@ -95,6 +105,8 @@ class Harness:
         video_id = frames[0].path.parent.parent.name if frames else "-"
         self.calls.append(f"describe {video_id}")
         assert all(frame.path.exists() for frame in frames)
+        if self.vision_down:
+            raise VisionUnavailableError("connection refused")
         return [FrameNote(frames[0].t_seconds, f"slide of {video_id}")] if frames else []
 
     async def add_to_kb(self, kb_name, notes_files):
@@ -420,3 +432,135 @@ async def test_jobs_are_scoped_to_their_owner(tmp_path, jpeg_of):
         recovered = stores[uid].load(job_id)
         assert recovered.status is JobStatus.waiting_for_playback
         assert recovered.videos[0].stage is VideoStage.queued
+
+
+@pytest.mark.asyncio
+async def test_invalid_kb_name_is_rejected_before_anything_is_saved(h):
+    with pytest.raises(ValueError, match="reserved characters"):
+        await h.runner.create(url=PLAYLIST_URL, kb_name="C++: what? #1")
+    assert h.store.list() == []
+
+
+@pytest.mark.asyncio
+async def test_default_kb_name_from_a_title_with_reserved_characters_is_valid(h):
+    h.listing = Listing("C++: Intro? #1 / 100% <fast>", h.listing.entries)
+    job = await h.runner.create(url=PLAYLIST_URL)
+    assert job.kb_name == "yt-c-intro-1-100-fast"
+
+
+@pytest.mark.asyncio
+async def test_unended_capture_without_player_duration_uses_listing_duration(h, jpeg_of):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    sink = h.runner.begin_capture(job.job_id, "a")
+    sink.offer_frame(5, jpeg_of(0))
+    job = await h.runner.finish_capture(
+        job.job_id, "a", ended=False, ad_seconds=0, player_duration=0
+    )
+    assert job.videos[0].stage is VideoStage.queued
+    assert job.videos[0].error_detail == "Captured 5s of 100s"
+
+
+@pytest.mark.asyncio
+async def test_unended_capture_with_no_known_duration_is_incomplete(h, jpeg_of):
+    h.listing = Listing("L", [PlaylistEntry("a", "A", 0, 1)])
+    job = await h.runner.create(url=PLAYLIST_URL)
+    sink = h.runner.begin_capture(job.job_id, "a")
+    sink.offer_frame(500, jpeg_of(0))
+    job = await h.runner.finish_capture(
+        job.job_id, "a", ended=False, ad_seconds=0, player_duration=0
+    )
+    assert job.videos[0].error_code == "incomplete_capture"
+
+
+@pytest.mark.asyncio
+async def test_unreachable_vision_model_fails_job_and_keeps_frames(h, jpeg_of):
+    h.vision_down = True
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.failed
+    assert (job.error_code, job.error_detail) == ("vision_unavailable", "connection refused")
+    assert _stages(job) == {"a": VideoStage.transcribed, "b": VideoStage.transcribed}
+    assert list((h.store.video_dir(job.job_id, "a") / "frames").glob("*.jpg"))
+    assert h.calls[-1] == "restore_chat"
+
+    h.vision_down = False
+    await h.runner.resume(job.job_id)
+    await h.runner.drain()
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.done
+    assert job.videos[0].frame_notes == 1
+
+
+@pytest.mark.asyncio
+async def test_saved_transcript_without_audio_is_reused(h, jpeg_of):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    # A crash after segments.json was written and audio deleted, before "transcribed".
+    video_dir = h.store.video_dir(job.job_id, "a")
+    (video_dir / "segments.json").write_text(json.dumps([[1.0, 2.0, "kept words"]]))
+    (video_dir / "audio.webm").unlink()
+    await h.play(job.job_id, "b", jpeg_of)
+    await h.runner.drain()
+
+    job = h.store.load(job.job_id)
+    assert job.status is JobStatus.done
+    assert "transcribe a" not in h.calls
+    assert job.videos[0].speech_cues == 1
+    notes = h.store.notes_path(job.job_id, h.listing.entries[0]).read_text(encoding="utf-8")
+    assert "kept words" in notes
+
+
+def _hold_lock(lock_path: Path) -> subprocess.Popen:
+    """Another process (a server or CLI run) that owns video imports."""
+    code = (
+        "import sys; from pathlib import Path; from deeptutor.video_import import ownership; "
+        "assert ownership.claim(Path(sys.argv[1])); print('held', flush=True); sys.stdin.read()"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout.readline().strip() == "held"
+    return process
+
+
+@pytest.mark.asyncio
+async def test_another_process_owning_imports_blocks_changes_and_defers_recovery(
+    h, jpeg_of, tmp_path
+):
+    job = await h.runner.create(url=PLAYLIST_URL)
+    await h.play(job.job_id, "a", jpeg_of)
+    h.runner.begin_capture(job.job_id, "b")
+    lock_path = h.store.root / "worker.lock"
+    ownership.release(lock_path)  # this "process" exits
+
+    other = _hold_lock(lock_path)
+    try:
+        fresh = Harness(tmp_path, jpeg_of, claim_poll_seconds=0.05)
+        for attempt in (
+            fresh.runner.create(url=PLAYLIST_URL),
+            fresh.runner.pause(job.job_id),
+            fresh.runner.resume(job.job_id),
+            fresh.runner.cancel(job.job_id),
+        ):
+            with pytest.raises(ownership.WorkerBusyError, match=r"pid \d+"):
+                await attempt
+        with pytest.raises(ownership.WorkerBusyError):
+            fresh.runner.begin_capture(job.job_id, "b")
+
+        await fresh.runner.recover()
+        assert fresh.store.load(job.job_id).videos[1].stage is VideoStage.capturing
+    finally:
+        other.stdin.close()
+        other.wait(timeout=30)
+        other.stdout.close()
+
+    await asyncio.wait_for(fresh.runner._claim_task, timeout=10)
+    assert fresh.store.load(job.job_id).videos[1].stage is VideoStage.queued
+    await fresh.runner.pause(job.job_id)

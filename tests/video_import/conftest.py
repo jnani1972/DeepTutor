@@ -43,3 +43,13 @@ def jpeg_of():
         return buffer.getvalue()
 
     return make
+
+
+@pytest.fixture(autouse=True)
+def _release_import_locks():
+    """Drop every worker lock this test process claimed (as a process exit would)."""
+    yield
+    from deeptutor.video_import import ownership
+
+    for path in list(ownership._held):
+        ownership.release(path)
