@@ -74,3 +74,40 @@ def test_notes_collapse_newlines_in_one_line_fields():
     assert "[00:02] screen: Slide: - point one ## Timeline [00:09] fake" in lines
     assert lines.count("## Timeline") == 1
     assert not any(ln.startswith("[00:03]") for ln in lines)
+
+
+def test_description_drops_link_lines_hashtags_and_disclaimer():
+    description = "\n".join(
+        [
+            "How to shortlist intraday stocks with a free screener.",
+            "Screener Link: https://example.com/screener?utm_source=youtube",
+            "👉 Dhan: https://dhan.co/",
+            "Slides for this lesson are at www.example.org/slides if you want to follow along.",
+            "#trading #stocks",
+            "",
+            "",
+            "We cover filters, confirmation and stop-loss placement.",
+            "Disclaimer:- Investment in securities market are subject to market risks.",
+            "SEBI Registered Stock Broker.",
+        ]
+    )
+    md = build_notes_markdown(PlaylistEntry("a" * 11, "X", 60, 1), "P", [], [], description=description)
+    section = md.split("## Description\n", 1)[1].split("\n## Timeline", 1)[0].strip()
+    assert section.splitlines() == [
+        "How to shortlist intraday stocks with a free screener.",
+        "Slides for this lesson are at if you want to follow along.",
+        "",
+        "We cover filters, confirmation and stop-loss placement.",
+    ]
+
+
+def test_description_of_only_links_is_omitted():
+    md = build_notes_markdown(
+        PlaylistEntry("a" * 11, "X", 60, 1), "P", [], [], description="Twitter: https://x.com/a\n#tag"
+    )
+    assert "## Description" not in md
+
+
+def test_single_video_header_does_not_repeat_its_title_as_playlist():
+    md = build_notes_markdown(PlaylistEntry("a" * 11, "Enzymes", 754, 1), "Enzymes", [], [])
+    assert md.splitlines()[2] == "Duration 12:34"

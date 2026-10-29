@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import re
 
 from deeptutor.reading.ingestion import TranscriptSegment
 from deeptutor.video_import.models import PlaylistEntry
 
 _DESCRIPTION_LIMIT = 4000
+_URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_MIN_WORDS_AFTER_LINK = 4
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,24 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def _clean_description(text: str) -> str:
+    """Keep the creator's explanation; drop link lists, hashtags and the legal tail."""
+    kept: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("disclaimer"):
+            break
+        if _URL.search(line):
+            line = " ".join(_URL.sub("", line).split())
+            if len(line.split()) < _MIN_WORDS_AFTER_LINK:
+                continue
+        if line and all(word.startswith("#") for word in line.split()):
+            continue
+        if line or (kept and kept[-1]):
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def build_notes_markdown(
     entry: PlaylistEntry,
     playlist_title: str,
@@ -45,18 +66,15 @@ def build_notes_markdown(
     chapters: Sequence[Chapter] = (),
     description: str = "",
 ) -> str:
-    lines = [
-        f"# {_one_line(entry.title)}",
-        "",
-        f"Playlist: {playlist_title} · Video {entry.position} · "
-        f"Duration {_clock(entry.duration_seconds)}",
-        "",
-    ]
+    duration = f"Duration {_clock(entry.duration_seconds)}"
+    if playlist_title != entry.title:
+        duration = f"Playlist: {playlist_title} · Video {entry.position} · {duration}"
+    lines = [f"# {_one_line(entry.title)}", "", duration, ""]
     if chapters:
         lines += ["## Chapters"]
         lines += [f"[{_clock(c.t_seconds)}] {_one_line(c.title)}" for c in chapters]
         lines.append("")
-    description = description.strip()[:_DESCRIPTION_LIMIT].strip()
+    description = _clean_description(description)[:_DESCRIPTION_LIMIT].strip()
     if description:
         lines += ["## Description", description, ""]
     lines.append("## Timeline")
