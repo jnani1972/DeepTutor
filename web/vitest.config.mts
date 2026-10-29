@@ -16,7 +16,7 @@ export default defineConfig({
       jsdom: { url: "http://localhost/" },
     },
     setupFiles: ["./tests/setup/rendered.ts"],
-    include: ["tests/**/*.spec.ts", "tests/**/*.spec.tsx"],
+    include: ["tests/**/*.spec.ts", "tests/**/*.spec.tsx", "features/**/*.test.ts"],
     clearMocks: true,
     restoreMocks: true,
   },
